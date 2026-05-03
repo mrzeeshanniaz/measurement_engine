@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "measurement-engine"
+version = "0.1.0"
+description = "A measurement engine for tailors to extract body measurements from images"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "mediapipe>=0.10.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=9.0.0",
+]
+
+[project.scripts]
+measurement-engine = "measurement_engine.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
