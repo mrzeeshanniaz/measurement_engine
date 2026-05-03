@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.measurement_engine.scan.schemas import (
     CameraMetadata,
@@ -164,7 +164,7 @@ class ScanPipeline:
         self,
         processed: list[_ProcessedFrame],
         height_cm: float,
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
         """
         Attempt multi-view SMPL mesh fitting.
         Falls back to single-view if only one usable frame exists.
@@ -204,6 +204,12 @@ class ScanPipeline:
         mesh: Optional[tuple[np.ndarray, np.ndarray]],
     ) -> RawMeasurements:
         verts, faces = mesh if mesh is not None else (None, None)
+
+        # Compute aspect ratio from the front frame so horizontal landmark
+        # distances are scaled correctly for non-square (portrait) images.
+        front_img = next((p.image for p in processed if p.pose_id == PoseID.FRONT), None)
+        aspect = (front_img.width / front_img.height) if front_img else 1.0
+
         extractor = MeasurementExtractor(
             height_cm=height_cm,
             front_landmarks=self._landmarks_for(processed, PoseID.FRONT),
@@ -212,6 +218,7 @@ class ScanPipeline:
             arms_landmarks=self._landmarks_for(processed, PoseID.ARMS_OUT),
             mesh_vertices=verts,
             mesh_faces=faces,
+            img_aspect_ratio=aspect,
         )
         return extractor.extract()
 
@@ -243,6 +250,7 @@ class ScanPipeline:
     def _decode_image(b64: str) -> Image.Image:
         data = base64.b64decode(b64)
         img = Image.open(io.BytesIO(data))
+        img = ImageOps.exif_transpose(img)  # correct phone rotation before any processing
         if img.mode != "RGB":
             img = img.convert("RGB")
         return img

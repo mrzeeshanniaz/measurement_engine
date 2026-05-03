@@ -42,7 +42,15 @@ def score_field(
     if value_cm is None:
         return MeasurementField(value_cm=None, confidence=Confidence.LOW, source=source)
 
-    if source == "smpl_mesh":
+    if source == "smpl_anthro_full":
+        # Best-accuracy path — SMPL-Anthropometry with PKL body model
+        conf = Confidence.HIGH if frame_composite >= 0.55 else Confidence.MEDIUM
+
+    elif source == "smpl_anthro_trimesh":
+        # Trimesh plane-intersection path — good but not full SMPL accuracy
+        conf = Confidence.HIGH if frame_composite >= 0.70 else Confidence.MEDIUM
+
+    elif source == "smpl_mesh":
         if frame_composite >= 0.70:
             conf = Confidence.HIGH
         elif frame_composite >= 0.45:

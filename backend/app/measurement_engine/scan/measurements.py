@@ -230,19 +230,20 @@ _RATIOS = {
 # ---------------------------------------------------------------------------
 
 _CLOTHING_OFFSETS_CM: dict[str, float] = {
-    "chest":      1.5,   # fitted t-shirt ≈ 0.5cm/side × 2 + ~0.5cm error margin
-    "under_bust": 1.2,
-    "waist":      1.0,
-    "abdomen":    1.2,
-    "hips":       1.2,
-    "neck":       0.5,
-    "bicep":      0.8,
-    "wrist":      0.3,
-    "thigh":      1.0,
-    "mid_thigh":  0.8,
-    "knee":       0.6,
-    "calf":       0.6,
-    "ankle":      0.3,
+    # Values from PRD Complete Measurement Specification §3.6 (clothing compensation)
+    "chest":      0.8,
+    "under_bust": 0.6,
+    "waist":      0.4,
+    "abdomen":    0.5,
+    "hips":       0.6,
+    "neck":       0.2,
+    "bicep":      0.4,
+    "wrist":      0.0,
+    "thigh":      0.5,
+    "mid_thigh":  0.4,
+    "knee":       0.3,
+    "calf":       0.3,
+    "ankle":      0.0,
 }
 
 
@@ -290,6 +291,7 @@ class MeasurementExtractor:
         arms_landmarks:   Optional[dict[int, LandmarkPoint]] = None,
         mesh_vertices:    Optional[np.ndarray] = None,
         mesh_faces:       Optional[np.ndarray] = None,
+        img_aspect_ratio: float = 1.0,
     ):
         self.height_cm = height_cm
         self.front = front_landmarks or {}
@@ -299,9 +301,13 @@ class MeasurementExtractor:
         self.mesh  = mesh_vertices
         self.mesh_faces = mesh_faces
 
-        # Scale factor: maps 1 unit of normalised landmark distance → cm
-        # MediaPipe normalises to image [0, 1]; we scale via body height.
-        # front-view: total body height in image ≈ ankle_y - nose_y in norm coords
+        # MediaPipe normalises x to [0, img_width] and y to [0, img_height]
+        # independently.  _px_to_cm is calibrated on the Y axis (body height span).
+        # Horizontal (X) measurements need the aspect ratio to convert correctly.
+        # For a 1080×1920 portrait: aspect = 1080/1920 = 0.5625.
+        self._aspect_ratio = img_aspect_ratio
+
+        # Scale factor: maps 1 unit of normalised Y distance → cm
         self._px_to_cm = self._compute_pixel_scale()
 
         # Mesh scale: if mesh provided, scale mesh-unit → cm
@@ -405,8 +411,8 @@ class MeasurementExtractor:
         return abs(lm_a.y - lm_b.y) * self._px_to_cm
 
     def _lm_dist_x(self, lm_a: LandmarkPoint, lm_b: LandmarkPoint) -> float:
-        """Horizontal distance (X axis) → cm."""
-        return abs(lm_a.x - lm_b.x) * self._px_to_cm
+        """Horizontal distance (X axis) → cm, corrected for image aspect ratio."""
+        return abs(lm_a.x - lm_b.x) * self._px_to_cm * self._aspect_ratio
 
     def _ratio_fallback(self, key: str) -> tuple[float, str]:
         return round(self.height_cm * _RATIOS[key], 1), "height_ratio"
@@ -708,37 +714,45 @@ class MeasurementExtractor:
         return self._ratio_fallback("inseam")
 
     def _outseam(self) -> tuple[Optional[float], str]:
-        lh = self.front.get(_L.L_HIP)
-        la = self.front.get(_L.L_ANKLE)
-        if lh and la and lh.visibility > 0.5 and la.visibility > 0.5:
-            # Outseam = inseam + rise (~10 cm typical)
-            inseam = self._lm_dist_y(lh, la)
-            return round(inseam + 10.0, 1), "landmark"
+        # Outseam = waist to floor along outer leg. MediaPipe has no waist landmark
+        # so we cannot compute this directly. The previous approach (inseam + 10 cm)
+        # was hardcoding a rise that varies 18–24 cm in practice.
+        # Height-ratio fallback (0.590 × height) is more accurate than a fixed offset.
         return self._ratio_fallback("outseam")
 
     def _crotch_depth_front(self) -> tuple[Optional[float], str]:
-        # Best from side frame: waist Y to crotch Y
-        lh = self.side.get(_L.L_HIP) or self.front.get(_L.L_HIP)
-        ls = self.side.get(_L.L_SHOULDER) or self.front.get(_L.L_SHOULDER)
-        if lh and ls and lh.visibility > 0.5:
-            # Crotch is roughly 70% of hip-to-shoulder distance above hip
-            torso = self._lm_dist_y(ls, lh)
-            return round(torso * 0.28, 1), "landmark"
+        # PRD M23: waist-to-crotch (front rise). No direct crotch landmark in
+        # MediaPipe; the mesh can give the waist-to-hip vertical drop which is
+        # the closest computable proxy. Landmark torso-fraction formulas produce
+        # ~14 cm when the expected value is ~29 cm — use height_ratio as fallback.
+        if self.mesh is not None and self._mesh_scale is not None:
+            # Waist at ~0.62, hip/crotch at ~0.52 → delta × height
+            waist_depth = self._mesh_depth_at_height_ratio(0.62)
+            hip_depth   = self._mesh_depth_at_height_ratio(0.52)
+            if waist_depth and hip_depth:
+                rise = round((0.62 - 0.52) * self.height_cm, 1)
+                return rise, "smpl_mesh"
         return self._ratio_fallback("crotch_front")
 
     def _crotch_depth_back(self) -> tuple[Optional[float], str]:
-        val, _ = self._crotch_depth_front()
-        if val:
-            return round(val * 1.05, 1), "landmark"
+        # Back rise is slightly longer than front rise (typically +0.5–1 cm)
+        if self.mesh is not None:
+            rise, source = self._crotch_depth_front()
+            if rise is not None:
+                return round(rise * 1.04, 1), source
         return self._ratio_fallback("crotch_back")
 
     def _torso_length(self) -> tuple[Optional[float], str]:
-        ls = self.front.get(_L.L_SHOULDER)
-        lh = self.front.get(_L.L_HIP)
-        if ls and lh and ls.visibility > 0.5 and lh.visibility > 0.5:
-            dist = self._lm_dist_y(ls, lh)
-            return round(dist, 1), "landmark"
-        return self._ratio_fallback("torso_length")
+        def _fallback():
+            # PRD M25: neck to crotch. MediaPipe has no crotch landmark; hip joint
+            # is the closest proxy (~2-4 cm above the perineum in standing pose).
+            ls = self.front.get(_L.L_SHOULDER)
+            lh = self.front.get(_L.L_HIP)
+            if ls and lh and ls.visibility > 0.5 and lh.visibility > 0.5:
+                dist = self._lm_dist_y(ls, lh)
+                return round(dist, 1), "landmark"
+            return self._ratio_fallback("torso_length")
+        return self._smpl_anthro_or("M25_torso_length", _fallback)
 
     # ------------------------------------------------------------------
     # Section D — Widths & depths

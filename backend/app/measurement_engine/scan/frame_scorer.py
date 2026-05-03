@@ -92,10 +92,9 @@ class FrameScorer:
     # ------------------------------------------------------------------
 
     def _blur_score(self, gray: np.ndarray) -> float:
-        """Laplacian variance normalised to [0, 1]."""
+        """Laplacian variance normalised to [0, 1]. SCAN-04: variance > 120 = sharp."""
         variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        # Empirically: < 50 is very blurry, > 500 is sharp
-        return float(np.clip(variance / 500.0, 0.0, 1.0))
+        return float(np.clip(variance / 120.0, 0.0, 1.0))
 
     def _pose_confidence(self, landmarks: Optional[dict]) -> float:
         if not landmarks:

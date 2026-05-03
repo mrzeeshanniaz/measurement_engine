@@ -129,21 +129,23 @@ class MediaPipePoseWrapper:
 
     @staticmethod
     def _fallback_landmarks() -> dict[int, RawLandmark]:
-        """Symmetric template positions — used only when Tasks API unavailable."""
+        """Symmetric template positions — used only when Tasks API unavailable.
+        Visibility is deliberately low (0.25) so confidence scoring never grants
+        HIGH confidence to these synthetic values."""
         positions = {
-            0:  (0.50, 0.07, 0.0,  0.99),  # nose
-            11: (0.38, 0.22, -0.05, 0.99),  # L shoulder
-            12: (0.62, 0.22, -0.05, 0.99),  # R shoulder
-            13: (0.28, 0.37, -0.03, 0.98),  # L elbow
-            14: (0.72, 0.37, -0.03, 0.98),  # R elbow
-            15: (0.22, 0.50, -0.02, 0.97),  # L wrist
-            16: (0.78, 0.50, -0.02, 0.97),  # R wrist
-            23: (0.42, 0.55, 0.0,  0.99),   # L hip
-            24: (0.58, 0.55, 0.0,  0.99),   # R hip
-            25: (0.41, 0.72, 0.02, 0.98),   # L knee
-            26: (0.59, 0.72, 0.02, 0.98),   # R knee
-            27: (0.40, 0.90, 0.04, 0.97),   # L ankle
-            28: (0.60, 0.90, 0.04, 0.97),   # R ankle
+            0:  (0.50, 0.07, 0.0,  0.25),  # nose
+            11: (0.38, 0.22, -0.05, 0.25),  # L shoulder
+            12: (0.62, 0.22, -0.05, 0.25),  # R shoulder
+            13: (0.28, 0.37, -0.03, 0.25),  # L elbow
+            14: (0.72, 0.37, -0.03, 0.25),  # R elbow
+            15: (0.22, 0.50, -0.02, 0.25),  # L wrist
+            16: (0.78, 0.50, -0.02, 0.25),  # R wrist
+            23: (0.42, 0.55, 0.0,  0.25),   # L hip
+            24: (0.58, 0.55, 0.0,  0.25),   # R hip
+            25: (0.41, 0.72, 0.02, 0.25),   # L knee
+            26: (0.59, 0.72, 0.02, 0.25),   # R knee
+            27: (0.40, 0.90, 0.04, 0.25),   # L ankle
+            28: (0.60, 0.90, 0.04, 0.25),   # R ankle
         }
         return {
             idx: RawLandmark(x=x, y=y, z=z, visibility=v)
