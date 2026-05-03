@@ -1,0 +1,15 @@
+{
+  "measurements": {
+    "M01_chest":                    { "value_cm": 105.41, "confidence": "HIGH", "source": "user_upload" }, // 41.5 in
+    "M03_waist":                    { "value_cm": 57.15,  "confidence": "HIGH", "source": "user_upload" }, // 22.5 in (Flat garment measurement)
+    "M05_hips":                     { "value_cm": 59.69,  "confidence": "HIGH", "source": "user_upload" }, // 23.5 in (Ghera/Hip flat)
+    "M06_neck":                     { "value_cm": 43.18,  "confidence": "HIGH", "source": "user_upload" }, // 17.0 in
+    "M13_ankle":                    { "value_cm": 20.32,  "confidence": "HIGH", "source": "user_upload" }, // 8.0 in (Poncha)
+    "M14_total_height":             { "value_cm": 175.0,  "confidence": "LOW",  "source": "inference" },   // Estimated 5'9"
+    "M17_kameez_length":            { "value_cm": 109.22, "confidence": "HIGH", "source": "user_upload" }, // 43.0 in
+    "M19_sleeve_length":            { "value_cm": 59.69,  "confidence": "HIGH", "source": "user_upload" }, // 23.5 in
+    "M22_outseam":                  { "value_cm": 104.14, "confidence": "HIGH", "source": "user_upload" }, // 41.0 in (Shalwar length)
+    "M26_shoulder_width":           { "value_cm": 53.34,  "confidence": "HIGH", "source": "user_upload" }, // 21.0 in (Tera)
+    "M29_hip_width":                { "value_cm": 53.34,  "confidence": "HIGH", "source": "user_upload" }  // 21.0 in (Shalwar waist/belt)
+  }
+}
