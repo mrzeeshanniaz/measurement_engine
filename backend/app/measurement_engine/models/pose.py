@@ -20,6 +20,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Heavy model = model_complexity=2 equivalent; best landmark accuracy.
@@ -28,7 +30,7 @@ _MODEL_URL = (
     "pose_landmarker/pose_landmarker_heavy/float16/latest/"
     "pose_landmarker_heavy.task"
 )
-_MODEL_PATH = Path(__file__).parents[3] / "models" / "pose_landmarker_heavy.task"
+_MODEL_PATH = Path(settings.MODEL_CACHE_DIR) / "pose_landmarker_heavy.task"
 
 
 class LM(IntEnum):

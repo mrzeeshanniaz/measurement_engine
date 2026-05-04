@@ -19,13 +19,15 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 _SEG_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
 )
-_SEG_PATH = Path(__file__).parents[3] / "models" / "selfie_segmenter.tflite"
+_SEG_PATH = Path(settings.MODEL_CACHE_DIR) / "selfie_segmenter.tflite"
 
 # Pixels with confidence above this threshold are classified as foreground.
 _CONF_THRESHOLD = 0.5
