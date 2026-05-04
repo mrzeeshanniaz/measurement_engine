@@ -45,17 +45,96 @@ class SMPLFitter:
         self.device = device
         self.is_loaded = False
         self._smpl_data: Optional[dict] = None
+        # Precomputed at load time so _estimate_betas() does no per-request einsums.
+        # Shape: (n_measurement_fns, n_betas=10)
+        self._jacobian: Optional[np.ndarray] = None
+        # Template baseline ratios (measurement / unit-height) for each fn.
+        self._template_ratios: Optional[np.ndarray] = None
 
     async def load(self) -> None:
         if _PKL_PATH.exists():
             with open(_PKL_PATH, "rb") as f:
                 self._smpl_data = pickle.load(f)
-            logger.info("SMPL fitter ready (REAL mode — %d verts, %d faces)",
-                        np.array(self._smpl_data["v_template"]).shape[0],
-                        np.array(self._smpl_data["f"]).shape[0])
+            n_verts = np.array(self._smpl_data["v_template"]).shape[0]
+            n_faces = np.array(self._smpl_data["f"]).shape[0]
+            logger.info("SMPL fitter ready (REAL mode — %d verts, %d faces)", n_verts, n_faces)
+            self._precompute_jacobian()
         else:
             logger.info("SMPL fitter ready (PARAMETRIC fallback — PKL not found at %s)", _PKL_PATH)
         self.is_loaded = True
+
+    def _precompute_jacobian(self) -> None:
+        """
+        Precompute dM/d_beta Jacobian for the three measurement functions used in
+        beta estimation.  This is constant for the template mesh and only needs
+        to run once at startup (~0.5 s) rather than on every scan request (~1-3 s).
+        """
+        import time
+        t0 = time.monotonic()
+        d = self._smpl_data
+        v_template = np.array(d["v_template"], dtype=np.float64)
+        shapedirs  = np.array(d["shapedirs"],  dtype=np.float64)
+        n_betas    = 10
+        delta      = 2.0
+
+        # The three measurement functions (must match _proportions_from_landmarks order)
+        meas_fns = [
+            self._make_shoulder_width_fn(),
+            self._make_hip_width_fn(),
+            self._make_torso_fn(),
+        ]
+
+        h0 = float(np.max(v_template[:, 1]) - np.min(v_template[:, 1]))
+        jacobian_rows = []
+        template_ratios = []
+
+        for meas_fn in meas_fns:
+            row = []
+            for i in range(n_betas):
+                b_p = np.zeros(n_betas); b_p[i] =  delta
+                b_m = np.zeros(n_betas); b_m[i] = -delta
+                vp = v_template + np.einsum("ijk,k->ij", shapedirs, b_p)
+                vm = v_template + np.einsum("ijk,k->ij", shapedirs, b_m)
+                hp = float(np.max(vp[:, 1]) - np.min(vp[:, 1]))
+                hm = float(np.max(vm[:, 1]) - np.min(vm[:, 1]))
+                mp_ = meas_fn(vp) / hp if hp > 0 else 0.0
+                mm_ = meas_fn(vm) / hm if hm > 0 else 0.0
+                row.append((mp_ - mm_) / (2 * delta))
+            jacobian_rows.append(row)
+            template_ratios.append(meas_fn(v_template) / h0 if h0 > 0 else 0.0)
+
+        self._jacobian        = np.array(jacobian_rows)          # (3, 10)
+        self._template_ratios = np.array(template_ratios)        # (3,)
+        logger.info("SMPL Jacobian precomputed in %.2f s", time.monotonic() - t0)
+
+    # ------------------------------------------------------------------
+    # Static measurement functions (used by precompute and estimate_betas)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_shoulder_width_fn():
+        def fn(v):
+            y_min, y_span = np.min(v[:, 1]), np.max(v[:, 1]) - np.min(v[:, 1])
+            y_cut = y_min + 0.82 * y_span
+            pts = v[np.abs(v[:, 1] - y_cut) < 0.02 * y_span]
+            return float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) > 1 else 0.0
+        return fn
+
+    @staticmethod
+    def _make_hip_width_fn():
+        def fn(v):
+            y_min, y_span = np.min(v[:, 1]), np.max(v[:, 1]) - np.min(v[:, 1])
+            y_cut = y_min + 0.52 * y_span
+            pts = v[np.abs(v[:, 1] - y_cut) < 0.02 * y_span]
+            return float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) > 1 else 0.0
+        return fn
+
+    @staticmethod
+    def _make_torso_fn():
+        def fn(v):
+            y_span = float(np.max(v[:, 1]) - np.min(v[:, 1]))
+            return abs(0.82 - 0.52) * y_span
+        return fn
 
     def fit(
         self,
@@ -128,51 +207,24 @@ class SMPLFitter:
     ) -> np.ndarray:
         """
         Estimate SMPL shape parameters from MediaPipe landmark proportions.
-
-        Uses visible body-width ratios (shoulder width, hip width) to set
-        the body size/shape betas via a least-squares fit against the SMPL
-        shape principal components.
+        Uses the precomputed Jacobian (dM/d_beta) so no per-request einsums.
         """
         if landmarks is None:
             return np.zeros(n_betas)
 
-        # Extract normalised proportions from front-view landmarks
-        # MediaPipe indices: L_SHOULDER=11, R_SHOULDER=12, L_HIP=23, R_HIP=24
-        # NOSE=0, L_ANKLE=27
-        proportions = self._proportions_from_landmarks(landmarks, height_cm)
-        if proportions is None:
+        ratios = self._ratios_from_landmarks(landmarks)
+        if ratios is None or self._jacobian is None or self._template_ratios is None:
             return np.zeros(n_betas)
 
-        # For each beta, compute what measurement it affects by finite difference
-        # on the template mesh (cheap, done at fit time)
-        delta = 2.0  # beta perturbation magnitude
-        target_measurements = []
-        jacobian_rows = []
+        # Build target vector: desired_ratio - template_ratio
+        # Only use rows where we have a valid landmark ratio.
+        valid = [(i, r) for i, r in enumerate(ratios) if r is not None]
+        if not valid:
+            return np.zeros(n_betas)
 
-        for name, ratio, meas_fn in proportions:
-            target_cm = ratio * height_cm
-            row = []
-            for i in range(n_betas):
-                b_plus  = np.zeros(n_betas); b_plus[i]  =  delta
-                b_minus = np.zeros(n_betas); b_minus[i] = -delta
-                v_plus  = v_template + np.einsum("ijk,k->ij", shapedirs, b_plus)
-                v_minus = v_template + np.einsum("ijk,k->ij", shapedirs, b_minus)
-                # Normalise both to unit height
-                h_plus  = np.max(v_plus[:, 1])  - np.min(v_plus[:, 1])
-                h_minus = np.max(v_minus[:, 1]) - np.min(v_minus[:, 1])
-                m_plus  = meas_fn(v_plus)  / h_plus  if h_plus  > 0 else 0.0
-                m_minus = meas_fn(v_minus) / h_minus if h_minus > 0 else 0.0
-                row.append((m_plus - m_minus) / (2 * delta))
-            jacobian_rows.append(row)
-
-            # Target = desired measurement ratio (measurement / height)
-            v0 = v_template
-            h0 = np.max(v0[:, 1]) - np.min(v0[:, 1])
-            m0 = meas_fn(v0) / h0 if h0 > 0 else 0.0
-            target_measurements.append(ratio - m0)
-
-        J = np.array(jacobian_rows)
-        t = np.array(target_measurements)
+        idx = [i for i, _ in valid]
+        t   = np.array([r - self._template_ratios[i] for i, r in valid])
+        J   = self._jacobian[idx]                               # (n_valid, 10)
 
         # Regularised least squares: minimise ||J @ betas - t||² + λ||betas||²
         lam = 0.1
@@ -181,73 +233,41 @@ class SMPLFitter:
             J.T @ t,
             rcond=None,
         )
-        # Clamp betas to plausible SMPL range
         return np.clip(betas, -3.0, 3.0)
 
-    def _proportions_from_landmarks(
+    def _ratios_from_landmarks(
         self,
         landmarks: dict,
-        height_cm: float,
-    ) -> Optional[list]:
+    ) -> Optional[list[Optional[float]]]:
         """
-        Extract observable body proportion ratios from MediaPipe front-view landmarks.
-        Returns list of (name, ratio, mesh_measurement_fn) tuples.
+        Extract the three body proportion ratios (shoulder_width, hip_width,
+        torso_length) that correspond to the three rows of _jacobian.
+        Returns [ratio_or_None, ratio_or_None, ratio_or_None].
+        Returns None if body span cannot be determined (no scale anchor).
         """
+        NOSE, L_ANKLE       = 0, 27
         L_SHOULDER, R_SHOULDER = 11, 12
-        L_HIP, R_HIP = 23, 24
-        NOSE, L_ANKLE = 0, 27
+        L_HIP, R_HIP        = 23, 24
 
-        lm = landmarks
-        proportions = []
-
-        # Body span in normalised coords (needed to convert to ratios)
-        nose  = lm.get(NOSE)
-        lankl = lm.get(L_ANKLE)
+        nose  = landmarks.get(NOSE)
+        lankl = landmarks.get(L_ANKLE)
         if not (nose and lankl and nose.visibility > 0.3 and lankl.visibility > 0.3):
             return None
         body_span = abs(lankl.y - nose.y)
         if body_span < 0.05:
             return None
 
-        def px_to_ratio(dx_norm):
-            return dx_norm / body_span
+        def norm(dx: float) -> float:
+            return dx / body_span
 
-        # Shoulder width
-        ls, rs = lm.get(L_SHOULDER), lm.get(R_SHOULDER)
-        if ls and rs and ls.visibility > 0.5 and rs.visibility > 0.5:
-            sw_ratio = px_to_ratio(abs(ls.x - rs.x))
-            def _shoulder_width_fn(v):
-                # X-span at ~82% height (shoulder level)
-                y_min, y_span = np.min(v[:, 1]), np.max(v[:, 1]) - np.min(v[:, 1])
-                y_cut = y_min + 0.82 * y_span
-                tol = 0.02 * y_span
-                pts = v[np.abs(v[:, 1] - y_cut) < tol]
-                return float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) > 1 else 0.0
-            proportions.append(("shoulder_width", sw_ratio, _shoulder_width_fn))
+        ls, rs = landmarks.get(L_SHOULDER), landmarks.get(R_SHOULDER)
+        lh, rh = landmarks.get(L_HIP),      landmarks.get(R_HIP)
 
-        # Hip width
-        lh, rh = lm.get(L_HIP), lm.get(R_HIP)
-        if lh and rh and lh.visibility > 0.5 and rh.visibility > 0.5:
-            hw_ratio = px_to_ratio(abs(lh.x - rh.x))
-            def _hip_width_fn(v):
-                y_min, y_span = np.min(v[:, 1]), np.max(v[:, 1]) - np.min(v[:, 1])
-                y_cut = y_min + 0.52 * y_span
-                tol = 0.02 * y_span
-                pts = v[np.abs(v[:, 1] - y_cut) < tol]
-                return float(np.max(pts[:, 0]) - np.min(pts[:, 0])) if len(pts) > 1 else 0.0
-            proportions.append(("hip_width", hw_ratio, _hip_width_fn))
+        sw = norm(abs(ls.x - rs.x)) if (ls and rs and ls.visibility > 0.5 and rs.visibility > 0.5) else None
+        hw = norm(abs(lh.x - rh.x)) if (lh and rh and lh.visibility > 0.5 and rh.visibility > 0.5) else None
+        tl = norm(abs(lh.y - ls.y)) if (ls and lh and ls.visibility > 0.5 and lh.visibility > 0.5) else None
 
-        # Torso length ratio (shoulder Y to hip Y)
-        if ls and lh and ls.visibility > 0.5 and lh.visibility > 0.5:
-            torso_ratio = px_to_ratio(abs(lh.y - ls.y))
-            def _torso_fn(v):
-                y_min, y_span = np.min(v[:, 1]), np.max(v[:, 1]) - np.min(v[:, 1])
-                shoulder_y = y_min + 0.82 * y_span
-                hip_y = y_min + 0.52 * y_span
-                return abs(shoulder_y - hip_y)
-            proportions.append(("torso_length", torso_ratio, _torso_fn))
-
-        return proportions if proportions else None
+        return [sw, hw, tl]
 
     # ------------------------------------------------------------------
     # PARAMETRIC fallback — cylinder-stack (original MVP)
