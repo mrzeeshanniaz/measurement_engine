@@ -57,6 +57,7 @@ class _ProcessedFrame:
     image: Image.Image
     landmarks: Optional[dict[int, LandmarkPoint]]
     score: FrameScore
+    body_mask: Optional[np.ndarray] = None   # uint8 (H,W): 255=person, 0=bg
 
 
 class ScanPipeline:
@@ -65,15 +66,17 @@ class ScanPipeline:
     wrappers are injected from app.state to avoid reloading between requests.
     """
 
-    def __init__(self, pose_model, smpl_model):
+    def __init__(self, pose_model, smpl_model, segmenter_model=None):
         """
         Args:
-            pose_model:  MediaPipePoseWrapper instance (already loaded).
-            smpl_model:  SMPLFitter instance (already loaded).
+            pose_model:       MediaPipePoseWrapper instance (already loaded).
+            smpl_model:       SMPLFitter instance (already loaded).
+            segmenter_model:  MediaPipeSegmenter instance (optional; may be None).
         """
-        self._pose      = pose_model
-        self._smpl      = smpl_model
-        self._scorer    = FrameScorer()
+        self._pose       = pose_model
+        self._smpl       = smpl_model
+        self._segmenter  = segmenter_model
+        self._scorer     = FrameScorer()
         self._height_est = HeightEstimator()
 
     # ------------------------------------------------------------------
@@ -140,19 +143,25 @@ class ScanPipeline:
         processed: list[_ProcessedFrame] = []
         for pf in frames:
             img = self._decode_image(pf.image_b64)
+
+            # Body segmentation (optional — None when segmenter is unavailable)
+            mask = self._segmenter.segment(img) if self._segmenter else None
+
             raw_lm = self._pose.detect_landmarks(img)
             lm = self._convert_landmarks(raw_lm)
-            score = self._scorer.score(img, pf.pose_id, lm)
+            score = self._scorer.score(img, pf.pose_id, lm, body_mask=mask)
             processed.append(_ProcessedFrame(
                 pose_id=pf.pose_id,
                 image=img,
                 landmarks=lm,
                 score=score,
+                body_mask=mask,
             ))
             logger.debug(
-                "Frame %s scored %.2f (blur=%.2f pose=%.2f angle=%.2f)",
+                "Frame %s scored %.2f (blur=%.2f pose=%.2f angle=%.2f occ=%.2f)",
                 pf.pose_id, score.composite,
                 score.blur_score, score.pose_confidence, score.angle_match,
+                score.occlusion_score,
             )
         return processed
 

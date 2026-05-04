@@ -72,6 +72,7 @@ def _run_pipeline_bg(
     body: ScanSubmitRequest,
     pose_model,
     smpl_model,
+    segmenter_model,
     units: str,
 ) -> None:
     """
@@ -81,7 +82,11 @@ def _run_pipeline_bg(
     """
     job_store.update(session_id, status="PROCESSING", progress_pct=10)
     try:
-        pipeline = ScanPipeline(pose_model=pose_model, smpl_model=smpl_model)
+        pipeline = ScanPipeline(
+            pose_model=pose_model,
+            smpl_model=smpl_model,
+            segmenter_model=segmenter_model,
+        )
 
         job_store.update(session_id, progress_pct=20)
         result = pipeline.run(
@@ -167,6 +172,7 @@ async def submit_scan(
         body,
         models.pose,
         models.smpl,
+        getattr(models, "segmenter", None),
         units,
     )
 
@@ -397,10 +403,12 @@ async def scan_health(request: Request) -> dict:
         1 for _ in range(len(job_store))
         if True  # counts all jobs including expired ones until purged
     )
+    seg = getattr(models, "segmenter", None) if models else None
     return {
         "pipeline": "ok",
         "models_loaded": models.is_loaded if models else False,
         "pose_model": models.pose.is_loaded if models else False,
+        "segmenter_model": seg.is_loaded if seg else False,
         "smpl_model": models.smpl.is_loaded if models else False,
         "queued_jobs": len(job_store),
     }
