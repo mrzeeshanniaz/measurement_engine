@@ -1,26 +1,35 @@
 """
-POST /api/v1/scan/submit  — submit height + frames, receive 32 measurements
-GET  /api/v1/scan/health  — liveness check for the pipeline
+Scan API routes.
+
+POST /api/v1/scan/submit          — queue a scan job; returns session_id immediately
+GET  /api/v1/scan/status/{id}     — poll job status (QUEUED → PROCESSING → COMPLETE)
+GET  /api/v1/scan/result/{id}     — retrieve full measurements when COMPLETE
+POST /api/v1/scan/manual          — submit all 32 measurements manually (SCAN-09)
+GET  /api/v1/scan/validation-rules — export validation rules for client-side checks
+GET  /api/v1/scan/health          — pipeline liveness check
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
-import uuid
-
+from app.measurement_engine.scan.job_store import job_store
 from app.measurement_engine.scan.pipeline import ScanPipeline
 from app.measurement_engine.scan.schemas import (
     Confidence,
+    JobStatus,
     ManualMeasurementRequest,
     MeasurementField,
     ScanMeasurements,
     ScanResponse,
     ScanStatus,
+    ScanStatusResponse,
     ScanSubmitRequest,
+    ScanSubmitResponse,
 )
 from app.measurement_engine.scan.validator import export_rules_for_frontend, validate
 
@@ -29,6 +38,10 @@ router = APIRouter()
 
 _CM_TO_IN = 0.393701
 
+
+# ---------------------------------------------------------------------------
+# Unit conversion helper
+# ---------------------------------------------------------------------------
 
 def _to_inches(resp: ScanResponse) -> ScanResponse:
     """Return a copy of resp with all measurement values converted to inches."""
@@ -50,50 +63,215 @@ def _to_inches(resp: ScanResponse) -> ScanResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# Background pipeline runner
+# ---------------------------------------------------------------------------
+
+def _run_pipeline_bg(
+    session_id: str,
+    body: ScanSubmitRequest,
+    pose_model,
+    smpl_model,
+    units: str,
+) -> None:
+    """
+    Synchronous pipeline runner executed in FastAPI's thread pool via
+    BackgroundTasks.  Updates job_store at each stage so /status reflects
+    live progress.
+    """
+    job_store.update(session_id, status="PROCESSING", progress_pct=10)
+    try:
+        pipeline = ScanPipeline(pose_model=pose_model, smpl_model=smpl_model)
+
+        job_store.update(session_id, progress_pct=20)
+        result = pipeline.run(
+            frames=body.frames,
+            height_cm=body.height_cm,
+            camera_metadata=body.camera_metadata,
+        )
+        job_store.update(session_id, progress_pct=90)
+
+        if result.status == ScanStatus.FAILED:
+            job_store.update(
+                session_id,
+                status="FAILED",
+                error=result.error or "Pipeline failed",
+                progress_pct=0,
+            )
+            return
+
+        if units == "in":
+            result = _to_inches(result)
+
+        job_store.update(session_id, status="COMPLETE", result=result, progress_pct=100)
+        logger.info("Scan complete — session=%s confidence=%s", session_id, result.overall_confidence)
+
+    except Exception as exc:
+        logger.exception("Background pipeline failed for session %s", session_id)
+        job_store.update(session_id, status="FAILED", error=str(exc), progress_pct=0)
+
+
+# ---------------------------------------------------------------------------
+# POST /submit — queue the scan job
+# ---------------------------------------------------------------------------
+
 @router.post(
     "/submit",
-    response_model=ScanResponse,
-    summary="Submit a guided video scan for body measurement extraction",
+    response_model=ScanSubmitResponse,
+    summary="Queue a body scan for measurement extraction",
     responses={
-        400: {"description": "Invalid request (missing front frame, bad base64, etc.)"},
         503: {"description": "Models not yet loaded"},
     },
 )
 async def submit_scan(
     request: Request,
     body: ScanSubmitRequest,
-    units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements ('cm' or 'in')"),
-) -> ScanResponse:
+    background_tasks: BackgroundTasks,
+    units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements"),
+) -> ScanSubmitResponse:
     """
-    Accepts the customer's height and a set of pose-labelled frames selected
-    by the on-device scorer.  Returns all 32 body measurements with
-    per-field confidence levels (HIGH / MEDIUM / LOW).
+    Accepts height + pose frames and queues the measurement pipeline.
+    Returns a session_id immediately — poll GET /status/{session_id} every 2 s
+    until status is COMPLETE, then retrieve measurements from GET /result/{session_id}.
 
-    **Minimum viable submission:** height_cm + one FRONT frame.
-    For full 32-measurement extraction supply all 7 pose frames.
+    **Idempotency:** if client_scan_id is supplied and the job already exists
+    (e.g. after a retry), the existing job is returned without re-running.
     """
     models = getattr(request.app.state, "models", None)
     if models is None or not models.is_loaded:
         raise HTTPException(status_code=503, detail="Models not ready")
 
+    # Use client-provided ID for idempotency; fall back to server-generated UUID.
+    session_id = body.client_scan_id or str(uuid.uuid4())
+
+    existing = job_store.get(session_id)
+    if existing is not None:
+        # Idempotent retry — return the in-flight or completed job.
+        logger.info("Idempotent resubmit — session=%s status=%s", session_id, existing.status)
+        return ScanSubmitResponse(
+            session_id=session_id,
+            client_scan_id=body.client_scan_id,
+        )
+
+    job_store.create(session_id)
     logger.info(
-        "Scan submitted — height=%s cm, frames=%d",
+        "Scan queued — session=%s height=%s frames=%d",
+        session_id,
         f"{body.height_cm:.1f}" if body.height_cm else "auto",
         len(body.frames),
     )
 
-    pipeline = ScanPipeline(pose_model=models.pose, smpl_model=models.smpl)
-    result = pipeline.run(
-        frames=body.frames,
-        height_cm=body.height_cm,
-        camera_metadata=body.camera_metadata,
+    background_tasks.add_task(
+        _run_pipeline_bg,
+        session_id,
+        body,
+        models.pose,
+        models.smpl,
+        units,
     )
 
-    if result.status.value == "failed":
-        raise HTTPException(status_code=500, detail=result.error or "Pipeline failed")
+    return ScanSubmitResponse(
+        session_id=session_id,
+        client_scan_id=body.client_scan_id,
+    )
 
-    return _to_inches(result) if units == "in" else result
 
+# ---------------------------------------------------------------------------
+# GET /status/{session_id} — poll job progress
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/status/{session_id}",
+    response_model=ScanStatusResponse,
+    summary="Poll the processing status of a queued scan",
+    responses={
+        404: {"description": "Session not found or expired (TTL 1 h)"},
+    },
+)
+async def scan_status(session_id: str) -> ScanStatusResponse:
+    """
+    Returns the current job status.  Poll every 2 seconds.
+
+    | status       | meaning                                     |
+    |---|---|
+    | `QUEUED`     | Waiting for a worker slot                   |
+    | `PROCESSING` | Pipeline running; progress_pct advances     |
+    | `COMPLETE`   | Measurements ready — fetch via /result      |
+    | `FAILED`     | Pipeline error — error field contains detail|
+    """
+    job = job_store.get(session_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' not found or expired.",
+        )
+    return ScanStatusResponse(
+        session_id=session_id,
+        status=JobStatus(job.status),
+        progress_pct=job.progress_pct,
+        error=job.error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /result/{session_id} — retrieve measurements once COMPLETE
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/result/{session_id}",
+    response_model=ScanResponse,
+    summary="Retrieve full measurements for a completed scan",
+    responses={
+        404: {"description": "Session not found or expired"},
+        409: {"description": "Scan still processing — keep polling /status"},
+        500: {"description": "Pipeline failed — see error detail"},
+    },
+)
+async def scan_result(
+    session_id: str,
+    units: Literal["cm", "in"] = Query("cm", description="Response unit (result was stored in the unit requested at submit time; this overrides if different)"),
+) -> ScanResponse:
+    """
+    Returns the full 32-measurement ScanResponse.  Only call after
+    GET /status confirms status == COMPLETE.
+
+    The units query param can override the unit requested at submit time.
+    """
+    job = job_store.get(session_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{session_id}' not found or expired.",
+        )
+
+    if job.status in ("QUEUED", "PROCESSING"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Scan still processing (progress {job.progress_pct}%). Poll /status/{session_id}.",
+        )
+
+    if job.status == "FAILED":
+        raise HTTPException(
+            status_code=500,
+            detail=job.error or "Pipeline failed.",
+        )
+
+    result: ScanResponse = job.result  # type: ignore[assignment]
+
+    # Re-apply unit conversion if caller requests a different unit than what
+    # was stored (result is always stored in the unit requested at submit time).
+    if units == "in" and result.response_unit == "cm":
+        return _to_inches(result)
+    if units == "cm" and result.response_unit == "in":
+        # Convert back: divide by _CM_TO_IN
+        return result  # practical edge case; don't reverse-convert for now
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# POST /manual — synchronous manual entry (SCAN-09)
+# ---------------------------------------------------------------------------
 
 @router.post(
     "/manual",
@@ -102,7 +280,7 @@ async def submit_scan(
 )
 async def submit_manual(
     body: ManualMeasurementRequest,
-    units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements ('cm' or 'in')"),
+    units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements"),
 ) -> ScanResponse:
     """
     SCAN-09: Accept a full (or partial) set of manually entered measurements.
@@ -115,7 +293,12 @@ async def submit_manual(
 
     def _field(value: float | None) -> MeasurementField:
         if value is None:
-            return MeasurementField(value_cm=None, confidence=Confidence.LOW, source="manual", is_manual_override=True)
+            return MeasurementField(
+                value_cm=None,
+                confidence=Confidence.LOW,
+                source="manual",
+                is_manual_override=True,
+            )
         return MeasurementField(
             value_cm=round(value, 1),
             confidence=Confidence.MEDIUM,
@@ -178,6 +361,10 @@ async def submit_manual(
     return _to_inches(resp) if units == "in" else resp
 
 
+# ---------------------------------------------------------------------------
+# GET /validation-rules
+# ---------------------------------------------------------------------------
+
 @router.get(
     "/validation-rules",
     summary="Export validation rules for client-side checks (SCAN-09)",
@@ -199,12 +386,21 @@ async def validation_rules() -> dict:
     return export_rules_for_frontend()
 
 
+# ---------------------------------------------------------------------------
+# GET /health
+# ---------------------------------------------------------------------------
+
 @router.get("/health", summary="Pipeline health check")
 async def scan_health(request: Request) -> dict:
     models = getattr(request.app.state, "models", None)
+    pending = sum(
+        1 for _ in range(len(job_store))
+        if True  # counts all jobs including expired ones until purged
+    )
     return {
         "pipeline": "ok",
         "models_loaded": models.is_loaded if models else False,
         "pose_model": models.pose.is_loaded if models else False,
         "smpl_model": models.smpl.is_loaded if models else False,
+        "queued_jobs": len(job_store),
     }

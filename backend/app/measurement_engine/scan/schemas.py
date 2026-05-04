@@ -10,7 +10,7 @@ Flow:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -184,6 +184,33 @@ class ScanStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETE   = "complete"
     FAILED     = "failed"
+
+
+# ---------------------------------------------------------------------------
+# Async job schemas — POST /submit returns immediately; app polls /status
+# ---------------------------------------------------------------------------
+
+class ScanSubmitResponse(BaseModel):
+    """Immediate acknowledgement returned by POST /submit."""
+    session_id: str = Field(..., description="Server-assigned session ID — use for /status and /result polling")
+    client_scan_id: Optional[str] = Field(None, description="Echo of the client_scan_id if supplied")
+    status: Literal["QUEUED"] = "QUEUED"
+    eta_seconds: int = Field(8, description="Estimated processing time in seconds")
+
+
+class JobStatus(str, Enum):
+    QUEUED     = "QUEUED"
+    PROCESSING = "PROCESSING"
+    COMPLETE   = "COMPLETE"
+    FAILED     = "FAILED"
+
+
+class ScanStatusResponse(BaseModel):
+    """Response from GET /status/{session_id} — poll every 2 s until COMPLETE."""
+    session_id: str
+    status: JobStatus
+    progress_pct: int = Field(0, ge=0, le=100, description="0–100 processing progress")
+    error: Optional[str] = Field(None, description="Set when status is FAILED")
 
 
 # ---------------------------------------------------------------------------
