@@ -30,6 +30,31 @@ class PoseID(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Garment type + fit style (F8 / F9)
+# ---------------------------------------------------------------------------
+
+class GarmentType(str, Enum):
+    KAMEEZ        = "kameez"        # long tunic (women / unisex)
+    KURTA         = "kurta"         # shorter tunic (men)
+    SHALWAR       = "shalwar"       # traditional baggy trousers
+    TROUSER       = "trouser"       # fitted trousers / pants
+    SHIRT         = "shirt"         # men's formal / casual shirt
+    SHERWANI      = "sherwani"      # men's formal long coat
+    DRESS         = "dress"         # full / midi-length dress
+    SUIT_JACKET   = "suit_jacket"   # men's suit jacket / blazer
+    BLOUSE        = "blouse"        # women's short top
+    SKIRT         = "skirt"         # skirt (knee / ankle length)
+    LEHENGA_SKIRT = "lehenga_skirt" # full circular skirt
+    COAT          = "coat"          # overcoat / long coat
+
+
+class FitStyle(str, Enum):
+    FITTED  = "fitted"   # body-con; minimum ease
+    REGULAR = "regular"  # standard comfortable fit
+    RELAXED = "relaxed"  # loose / flowy; maximum ease
+
+
+# ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
 
@@ -85,6 +110,15 @@ class ScanSubmitRequest(BaseModel):
         ..., min_length=1, max_length=8,
         description="Selected frames from the guided video scan (1-8 frames)",
     )
+    # F8 / F9: optional garment context
+    garment_type: Optional[GarmentType] = Field(
+        None,
+        description="Garment being made. When set, required measurements are flagged and missing ones raise validation errors.",
+    )
+    fit_style: Optional[FitStyle] = Field(
+        None,
+        description="Desired fit style. When set, ease allowances and cutting dimensions are added to each relevant measurement.",
+    )
 
     @model_validator(mode="after")
     def require_height_or_camera(self) -> "ScanSubmitRequest":
@@ -127,6 +161,20 @@ class MeasurementField(BaseModel):
     is_manual_override: bool = Field(
         False,
         description="True when the customer manually entered or corrected this measurement (SCAN-09)",
+    )
+    # F8: garment relevance flag (None when no garment_type was specified)
+    is_required_for_garment: Optional[bool] = Field(
+        None,
+        description="True when this measurement is required for the requested garment type; None when no garment_type was specified",
+    )
+    # F9: ease allowance fields (None when no fit_style was specified)
+    ease_cm: Optional[float] = Field(
+        None,
+        description="Ease allowance added to body measurement for the requested fit_style (same unit as value_cm)",
+    )
+    cutting_value_cm: Optional[float] = Field(
+        None,
+        description="value_cm + ease_cm — the dimension the tailor cuts to (same unit as value_cm)",
     )
 
 
@@ -255,6 +303,8 @@ class ScanResponse(BaseModel):
     response_unit: str = Field("cm", description="Unit used for all measurement values: 'cm' or 'in'")
     measurements: Optional[ScanMeasurements] = None
     validation: Optional[ValidationResult] = Field(None, description="Self-validation result — errors block ordering, warnings are advisory")
+    garment_type: Optional[GarmentType] = Field(None, description="Garment type from the request, echoed back")
+    fit_style: Optional[FitStyle] = Field(None, description="Fit style from the request, echoed back")
     error: Optional[str] = None
 
 
@@ -310,6 +360,8 @@ class ManualMeasurementRequest(BaseModel):
     Each supplied value is validated against its physiological min/max range.
     """
     height_cm: float = Field(..., gt=100.0, lt=250.0)
+    garment_type: Optional[GarmentType] = Field(None, description="Optional garment context for required-field validation and ease allowances")
+    fit_style: Optional[FitStyle] = Field(None, description="Optional fit style for ease allowance computation")
 
     M01_chest:       Optional[float] = Field(None, gt=_MANUAL_RANGES["M01"][0], lt=_MANUAL_RANGES["M01"][1])
     M02_under_bust:  Optional[float] = Field(None, gt=_MANUAL_RANGES["M02"][0], lt=_MANUAL_RANGES["M02"][1])

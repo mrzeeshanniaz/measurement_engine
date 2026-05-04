@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.measurement_engine.scan.schemas import (
+    GarmentType,
     PoseID,
     ScanMeasurements,
     ValidationIssue,
@@ -453,21 +454,59 @@ def _pass_confidence(measurements: ScanMeasurements) -> list[ValidationIssue]:
 
 
 # ---------------------------------------------------------------------------
+# Pass 4 — Garment-specific required-field check (F8)
+# ---------------------------------------------------------------------------
+
+def _pass_garment_required(
+    measurements: ScanMeasurements,
+    garment_type: Optional[GarmentType],
+) -> list[ValidationIssue]:
+    """Raise an ERROR for each measurement that is required for garment_type but has no value."""
+    if garment_type is None:
+        return []
+
+    from app.measurement_engine.scan.garments import GARMENT_REQUIRED_FIELDS
+
+    required_codes = GARMENT_REQUIRED_FIELDS.get(garment_type, set())
+    issues: list[ValidationIssue] = []
+
+    for code in sorted(required_codes):
+        attr = _code_to_attr(code)
+        if _v(measurements, attr) is None:
+            issues.append(ValidationIssue(
+                severity=Severity.ERROR,
+                code=f"missing_required_{code.lower()}_{garment_type.value}",
+                message=(
+                    f"{code} is required to cut a {garment_type.value} but was not measured. "
+                    f"Ensure this body area is fully visible in the scan."
+                ),
+                fields=[code],
+                rescan_poses=_poses_for(code),
+                suggestion=f"Redo the scan so that your {attr.replace('_', ' ')} is clearly captured.",
+            ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def validate(
     measurements: ScanMeasurements,
     height_cm: float,
+    garment_type: Optional[GarmentType] = None,
 ) -> ValidationResult:
     """
-    Run all three passes and return a consolidated ValidationResult.
+    Run all validation passes and return a consolidated ValidationResult.
+    Pass 4 (garment-required) is skipped when garment_type is None.
     """
     issues: list[ValidationIssue] = []
     issues += _pass_hard_limits(measurements)
     issues += _pass_norms(measurements, height_cm)
     issues += _pass_cross_rules(measurements)
     issues += _pass_confidence(measurements)
+    issues += _pass_garment_required(measurements, garment_type)
 
     errors = [i for i in issues if i.severity == Severity.ERROR]
     is_valid = len(errors) == 0

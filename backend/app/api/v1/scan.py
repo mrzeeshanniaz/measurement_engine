@@ -19,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
 from app.measurement_engine.scan.job_store import job_store
 from app.measurement_engine.scan.pipeline import ScanPipeline
+from app.measurement_engine.scan.garments import apply_garment_profile
 from app.measurement_engine.scan.schemas import (
     Confidence,
     JobStatus,
@@ -53,8 +54,15 @@ def _to_inches(resp: ScanResponse) -> ScanResponse:
     converted: dict = {}
     for fname in resp.measurements.model_fields:
         mf: MeasurementField = getattr(resp.measurements, fname)
-        new_val = round(mf.value_cm * _CM_TO_IN, 2) if mf.value_cm is not None else None
-        converted[fname] = mf.model_copy(update={"value_cm": new_val, "unit": "in"})
+        new_val     = round(mf.value_cm          * _CM_TO_IN, 2) if mf.value_cm          is not None else None
+        new_ease    = round(mf.ease_cm            * _CM_TO_IN, 2) if mf.ease_cm            is not None else None
+        new_cutting = round(mf.cutting_value_cm   * _CM_TO_IN, 2) if mf.cutting_value_cm   is not None else None
+        converted[fname] = mf.model_copy(update={
+            "value_cm":          new_val,
+            "unit":              "in",
+            "ease_cm":           new_ease,
+            "cutting_value_cm":  new_cutting,
+        })
 
     return resp.model_copy(update={
         "response_unit": "in",
@@ -93,6 +101,8 @@ def _run_pipeline_bg(
             frames=body.frames,
             height_cm=body.height_cm,
             camera_metadata=body.camera_metadata,
+            garment_type=body.garment_type,
+            fit_style=body.fit_style,
         )
         job_store.update(session_id, progress_pct=90)
 
@@ -352,7 +362,8 @@ async def submit_manual(
         M32_armhole_depth=_field(body.M32_armhole_depth),
     )
 
-    validation = validate(measurements, body.height_cm)
+    measurements = apply_garment_profile(measurements, body.garment_type, body.fit_style)
+    validation = validate(measurements, body.height_cm, body.garment_type)
 
     resp = ScanResponse(
         scan_id=str(uuid.uuid4()),
@@ -363,6 +374,8 @@ async def submit_manual(
         height_source="manual",
         measurements=measurements,
         validation=validation,
+        garment_type=body.garment_type,
+        fit_style=body.fit_style,
     )
     return _to_inches(resp) if units == "in" else resp
 

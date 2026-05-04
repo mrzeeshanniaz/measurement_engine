@@ -28,7 +28,9 @@ from PIL import Image, ImageOps
 from app.measurement_engine.scan.schemas import (
     CameraMetadata,
     Confidence,
+    FitStyle,
     FrameScore,
+    GarmentType,
     PoseFrame,
     PoseID,
     ScanMeasurements,
@@ -89,6 +91,8 @@ class ScanPipeline:
         frames: list[PoseFrame],
         height_cm: Optional[float] = None,
         camera_metadata: Optional[CameraMetadata] = None,
+        garment_type: Optional[GarmentType] = None,
+        fit_style: Optional[FitStyle] = None,
     ) -> ScanResponse:
         scan_id = str(uuid.uuid4())
 
@@ -127,7 +131,12 @@ class ScanPipeline:
             measurements, conf = self._score(
                 raw, processed, height_est.source, height_est.confidence, mesh_fit_score
             )
-            validation = validate(measurements, height_est.value_cm)
+
+            # F8/F9: mark required fields and compute ease / cutting dimensions
+            from app.measurement_engine.scan.garments import apply_garment_profile
+            measurements = apply_garment_profile(measurements, garment_type, fit_style)
+
+            validation = validate(measurements, height_est.value_cm, garment_type)
 
             return ScanResponse(
                 scan_id=scan_id,
@@ -138,6 +147,8 @@ class ScanPipeline:
                 height_source=height_est.source,
                 measurements=measurements,
                 validation=validation,
+                garment_type=garment_type,
+                fit_style=fit_style,
             )
 
         except Exception as exc:
