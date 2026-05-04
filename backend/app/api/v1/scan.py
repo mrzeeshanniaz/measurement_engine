@@ -59,31 +59,45 @@ def _persist_profile_sync(**kwargs) -> None:
 # Unit conversion helper
 # ---------------------------------------------------------------------------
 
-def _to_inches(resp: ScanResponse) -> ScanResponse:
-    """Return a copy of resp with all measurement values converted to inches."""
-    new_height = round(resp.height_cm * _CM_TO_IN, 2) if resp.height_cm is not None else None
+def _convert_measurements(
+    resp: ScanResponse,
+    factor: float,
+    target_unit: str,
+) -> ScanResponse:
+    """Return a copy of resp with all measurement values multiplied by factor."""
+    new_height = round(resp.height_cm * factor, 2) if resp.height_cm is not None else None
 
     if resp.measurements is None:
-        return resp.model_copy(update={"response_unit": "in", "height_cm": new_height})
+        return resp.model_copy(update={"response_unit": target_unit, "height_cm": new_height})
 
     converted: dict = {}
     for fname in resp.measurements.model_fields:
         mf: MeasurementField = getattr(resp.measurements, fname)
-        new_val     = round(mf.value_cm          * _CM_TO_IN, 2) if mf.value_cm          is not None else None
-        new_ease    = round(mf.ease_cm            * _CM_TO_IN, 2) if mf.ease_cm            is not None else None
-        new_cutting = round(mf.cutting_value_cm   * _CM_TO_IN, 2) if mf.cutting_value_cm   is not None else None
+        new_val     = round(mf.value_cm        * factor, 2) if mf.value_cm        is not None else None
+        new_ease    = round(mf.ease_cm         * factor, 2) if mf.ease_cm         is not None else None
+        new_cutting = round(mf.cutting_value_cm * factor, 2) if mf.cutting_value_cm is not None else None
         converted[fname] = mf.model_copy(update={
             "value_cm":          new_val,
-            "unit":              "in",
+            "unit":              target_unit,
             "ease_cm":           new_ease,
             "cutting_value_cm":  new_cutting,
         })
 
     return resp.model_copy(update={
-        "response_unit": "in",
+        "response_unit": target_unit,
         "height_cm": new_height,
         "measurements": ScanMeasurements(**converted),
     })
+
+
+def _to_inches(resp: ScanResponse) -> ScanResponse:
+    """Return a copy of resp with all measurement values converted to inches."""
+    return _convert_measurements(resp, _CM_TO_IN, "in")
+
+
+def _to_cm(resp: ScanResponse) -> ScanResponse:
+    """Return a copy of resp with all measurement values converted back to cm."""
+    return _convert_measurements(resp, 1.0 / _CM_TO_IN, "cm")
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +331,7 @@ async def scan_result(
     if units == "in" and result.response_unit == "cm":
         return _to_inches(result)
     if units == "cm" and result.response_unit == "in":
-        # Convert back: divide by _CM_TO_IN
-        return result  # practical edge case; don't reverse-convert for now
+        return _to_cm(result)
 
     return result
 
@@ -450,16 +463,16 @@ async def validation_rules() -> dict:
 @router.get("/health", summary="Pipeline health check")
 async def scan_health(request: Request) -> dict:
     models = getattr(request.app.state, "models", None)
-    pending = sum(
-        1 for _ in range(len(job_store))
-        if True  # counts all jobs including expired ones until purged
-    )
     seg = getattr(models, "segmenter", None) if models else None
+    job_counts = job_store.counts()
     return {
         "pipeline": "ok",
         "models_loaded": models.is_loaded if models else False,
         "pose_model": models.pose.is_loaded if models else False,
         "segmenter_model": seg.is_loaded if seg else False,
         "smpl_model": models.smpl.is_loaded if models else False,
-        "queued_jobs": len(job_store),
+        "jobs_queued": job_counts["QUEUED"],
+        "jobs_processing": job_counts["PROCESSING"],
+        "jobs_complete": job_counts["COMPLETE"],
+        "jobs_failed": job_counts["FAILED"],
     }

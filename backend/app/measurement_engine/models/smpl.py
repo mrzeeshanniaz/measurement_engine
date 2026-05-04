@@ -334,7 +334,7 @@ class SMPLFitter:
         shapedirs_flat = self._shapedirs_flat
 
         def _loss(betas: np.ndarray) -> float:
-            betas = np.asarray(betas, dtype=np.float64)
+            betas = np.clip(np.asarray(betas, dtype=np.float64), -3.0, 3.0)
             v = v_template + (shapedirs_flat @ betas).reshape(-1, 3)
             mesh_h = float(np.max(v[:, 1]) - np.min(v[:, 1]))
             if mesh_h < 1e-6:

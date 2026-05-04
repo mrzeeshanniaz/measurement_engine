@@ -457,6 +457,59 @@ def _pass_confidence(measurements: ScanMeasurements) -> list[ValidationIssue]:
 # Pass 4 — Garment-specific required-field check (F8)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pass 5 — Mesh quality gate (B8 / spec 5.1.7)
+# ---------------------------------------------------------------------------
+
+# Convex-hull silhouette IoU equivalent of the spec's 88% threshold.
+# Our IoU is a looser metric than per-pixel silhouette overlap, so 0.55 is
+# calibrated to roughly correspond to the 88% coverage threshold.
+_MESH_FIT_WARN_THRESHOLD  = 0.55
+_MESH_FIT_ERROR_THRESHOLD = 0.30
+
+
+def _pass_mesh_quality(mesh_fit_score: float) -> list[ValidationIssue]:
+    """
+    Warn (or error) when the fitted SMPL mesh silhouette doesn't match the
+    body well enough to trust depth-derived measurements (chest/waist depth,
+    circumferences).  Spec 5.1.7 requires ≥ 88% global fit score.
+    """
+    if mesh_fit_score >= _MESH_FIT_WARN_THRESHOLD:
+        return []
+
+    if mesh_fit_score < _MESH_FIT_ERROR_THRESHOLD:
+        return [ValidationIssue(
+            severity=Severity.ERROR,
+            code="mesh_fit_poor",
+            message=(
+                f"The body mesh fit score is very low ({mesh_fit_score:.2f}). "
+                "Depth-derived measurements (chest/waist depth, circumferences) are "
+                "unreliable and cannot be used for garment cutting."
+            ),
+            fields=["M01", "M03", "M05", "M30", "M31"],
+            rescan_poses=[PoseID.FRONT.value, PoseID.SIDE_LEFT.value],
+            suggestion=(
+                "Redo the scan in better lighting with tight-fitting clothes. "
+                "Ensure your full body is visible against a plain background."
+            ),
+        )]
+
+    return [ValidationIssue(
+        severity=Severity.WARNING,
+        code="mesh_fit_low",
+        message=(
+            f"The body mesh fit score is below the recommended threshold "
+            f"({mesh_fit_score:.2f} < {_MESH_FIT_WARN_THRESHOLD}). "
+            "Depth-derived measurements may be less accurate than usual."
+        ),
+        fields=["M30", "M31"],
+        rescan_poses=[PoseID.FRONT.value, PoseID.SIDE_LEFT.value],
+        suggestion=(
+            "For best results, redo the scan with tight-fitting clothes "
+            "against a plain, well-lit background."
+        ),
+    )]
+
 def _pass_garment_required(
     measurements: ScanMeasurements,
     garment_type: Optional[GarmentType],
@@ -496,10 +549,12 @@ def validate(
     measurements: ScanMeasurements,
     height_cm: float,
     garment_type: Optional[GarmentType] = None,
+    mesh_fit_score: float = 1.0,
 ) -> ValidationResult:
     """
     Run all validation passes and return a consolidated ValidationResult.
     Pass 4 (garment-required) is skipped when garment_type is None.
+    Pass 5 (mesh quality gate) is skipped when mesh_fit_score == 1.0 (no mesh).
     """
     issues: list[ValidationIssue] = []
     issues += _pass_hard_limits(measurements)
@@ -507,6 +562,7 @@ def validate(
     issues += _pass_cross_rules(measurements)
     issues += _pass_confidence(measurements)
     issues += _pass_garment_required(measurements, garment_type)
+    issues += _pass_mesh_quality(mesh_fit_score)
 
     errors = [i for i in issues if i.severity == Severity.ERROR]
     is_valid = len(errors) == 0

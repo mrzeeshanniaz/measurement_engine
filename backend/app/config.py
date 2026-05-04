@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     # Set AUTH_ENABLED=True in production; tokens are verified via Firebase Admin SDK.
     AUTH_ENABLED: bool = False
 
+    # CORS — comma-separated list of allowed origins.
+    # Set to specific domains in production (e.g. "https://tailorsync.app,https://www.tailorsync.app").
+    # "*" allows all origins (dev default).
+    CORS_ORIGINS: str = "*"
+
     class Config:
         env_file = ".env"
 

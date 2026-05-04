@@ -136,7 +136,10 @@ class ScanPipeline:
             from app.measurement_engine.scan.garments import apply_garment_profile
             measurements = apply_garment_profile(measurements, garment_type, fit_style)
 
-            validation = validate(measurements, height_est.value_cm, garment_type)
+            validation = validate(
+                measurements, height_est.value_cm, garment_type,
+                mesh_fit_score=mesh_fit_score,
+            )
 
             return ScanResponse(
                 scan_id=scan_id,

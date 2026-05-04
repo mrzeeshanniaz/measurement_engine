@@ -124,10 +124,12 @@ def overall_confidence(measurements: ScanMeasurements) -> Confidence:
     return Confidence.HIGH
 
 
+_CONF_RANK: dict[Confidence, int] = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
+
+
 def _cap_confidence(conf: Confidence, ceiling: Confidence) -> Confidence:
     """Lower conf to ceiling when the height anchor is uncertain."""
-    _rank = {Confidence.HIGH: 0, Confidence.MEDIUM: 1, Confidence.LOW: 2}
-    return conf if _rank[conf] >= _rank[ceiling] else ceiling
+    return conf if _CONF_RANK[conf] >= _CONF_RANK[ceiling] else ceiling
 
 
 def build_scan_measurements(

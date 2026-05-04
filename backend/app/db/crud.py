@@ -11,7 +11,6 @@ Functions return None / empty list when db is None (persistence disabled).
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
@@ -48,17 +47,14 @@ def save_profile_sync(
         return None
 
     try:
-        # Check for existing document by scan_id
-        existing = (
-            db.collection(COLLECTION)
-            .where("scan_id", "==", scan_id)
-            .limit(1)
-            .stream()
-        )
-        for doc in existing:
+        # Use scan_id as the Firestore document ID so concurrent retries for the
+        # same scan naturally converge on the same document (idempotent by design).
+        profile_id = scan_id
+        doc_ref = db.collection(COLLECTION).document(profile_id)
+        doc = doc_ref.get()
+        if doc.exists:
             return MeasurementProfile.from_firestore(doc.id, doc.to_dict())
 
-        profile_id = str(uuid.uuid4())
         profile = MeasurementProfile(
             id=profile_id,
             customer_id=customer_id,
@@ -72,7 +68,7 @@ def save_profile_sync(
             garment_type=garment_type,
             fit_style=fit_style,
         )
-        db.collection(COLLECTION).document(profile_id).set(profile.to_firestore())
+        doc_ref.set(profile.to_firestore())
         logger.info("Profile saved — id=%s customer=%s", profile_id[:8], customer_id)
         return profile
     except Exception as exc:
@@ -90,18 +86,16 @@ def list_profiles_sync(
         return []
     try:
         from google.cloud.firestore import Query
-        docs = (
+        query = (
             db.collection(COLLECTION)
             .where("customer_id", "==", customer_id)
             .order_by("created_at", direction=Query.DESCENDING)
-            .limit(limit + offset)
-            .stream()
+            .limit(limit)
         )
-        all_docs = list(docs)
-        return [
-            MeasurementProfile.from_firestore(d.id, d.to_dict())
-            for d in all_docs[offset:]
-        ]
+        if offset > 0:
+            query = query.offset(offset)
+        docs = query.stream()
+        return [MeasurementProfile.from_firestore(d.id, d.to_dict()) for d in docs]
     except Exception as exc:
         logger.error("list_profiles_sync failed for customer %s: %s", customer_id, exc)
         return []

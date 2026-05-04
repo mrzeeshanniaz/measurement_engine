@@ -89,6 +89,14 @@ class JobStore:
                 del self._jobs[sid]
             return len(expired)
 
+    def counts(self) -> dict[str, int]:
+        """Return a snapshot of job counts per status."""
+        with self._lock:
+            result: dict[str, int] = {"QUEUED": 0, "PROCESSING": 0, "COMPLETE": 0, "FAILED": 0}
+            for job in self._jobs.values():
+                result[job.status] = result.get(job.status, 0) + 1
+            return result
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._jobs)
