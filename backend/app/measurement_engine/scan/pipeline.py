@@ -201,24 +201,41 @@ class ScanPipeline:
         height_cm: float,
     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
         """
-        Attempt multi-view SMPL mesh fitting.
-        Falls back to single-view if only one usable frame exists.
-        Returns scaled mesh vertices (N, 3) or None.
+        B8: Multi-view SMPL mesh fitting.
+
+        Collects body masks from all available poses (front, side, back) and
+        passes them to fit_multiview() for silhouette-IoU-guided beta refinement.
+        Falls back gracefully when masks or extra views are absent.
         """
         usable = [p for p in processed if p.score.is_usable]
         if not usable:
             logger.warning("No usable frames for mesh fitting — using landmark-only path")
             return None
 
-        # Prefer FRONT frame as primary
-        primary = self._get_frame(usable, PoseID.FRONT) or usable[0]
+        front_lm = self._landmarks_for(processed, PoseID.FRONT)
+
+        # Gather body masks per view for multi-view silhouette optimization
+        def _mask_for(pose: PoseID) -> Optional[np.ndarray]:
+            frame = self._get_frame(processed, pose)
+            return frame.body_mask if frame else None
+
+        front_mask = _mask_for(PoseID.FRONT)
+        side_mask  = _mask_for(PoseID.SIDE_LEFT)
+        back_mask  = _mask_for(PoseID.BACK)
+
+        n_views = sum(m is not None for m in (front_mask, side_mask, back_mask))
+        logger.info(
+            "SMPL fit: height=%.1f cm, landmark_views=1, mask_views=%d",
+            height_cm, n_views,
+        )
 
         try:
-            front_lm = self._landmarks_for(processed, PoseID.FRONT)
-            mesh_result = self._smpl.fit(
-                primary.image,
+            mesh_result = self._smpl.fit_multiview(
                 landmarks=front_lm,
                 height_cm=height_cm,
+                front_mask=front_mask,
+                side_mask=side_mask,
+                back_mask=back_mask,
             )
             if mesh_result is None:
                 return None, None
