@@ -29,6 +29,7 @@ def score_field(
     source: str,
     frame_composite: float,
     landmark_visibility: float = 1.0,
+    mesh_fit_score: float = 1.0,
 ) -> MeasurementField:
     """
     Assign a Confidence level to one measurement field.
@@ -38,22 +39,33 @@ def score_field(
         source:             'smpl_mesh', 'landmark', 'derived', or 'height_ratio'.
         frame_composite:    Best composite score of the frame(s) that contributed.
         landmark_visibility: Mean visibility of the landmarks used (0-1).
+        mesh_fit_score:     Silhouette IoU of the fitted SMPL mesh (0-1, 1.0 = no info).
     """
     if value_cm is None:
         return MeasurementField(value_cm=None, confidence=Confidence.LOW, source=source)
 
+    # For SMPL-derived measurements the effective quality is the product of
+    # frame quality and how well the mesh silhouette matches the actual body.
+    # Formula: cap composite at (0.30 + 0.70 × mesh_fit_score) so a poor mesh
+    # fit (IoU=0.30) cannot yield a composite above 0.51 (≤ MEDIUM threshold).
+    if source in ("smpl_anthro_full", "smpl_anthro_trimesh", "smpl_mesh"):
+        mesh_ceiling = 0.30 + 0.70 * mesh_fit_score
+        effective_composite = min(frame_composite, mesh_ceiling)
+    else:
+        effective_composite = frame_composite
+
     if source == "smpl_anthro_full":
         # Best-accuracy path — SMPL-Anthropometry with PKL body model
-        conf = Confidence.HIGH if frame_composite >= 0.55 else Confidence.MEDIUM
+        conf = Confidence.HIGH if effective_composite >= 0.55 else Confidence.MEDIUM
 
     elif source == "smpl_anthro_trimesh":
         # Trimesh plane-intersection path — good but not full SMPL accuracy
-        conf = Confidence.HIGH if frame_composite >= 0.70 else Confidence.MEDIUM
+        conf = Confidence.HIGH if effective_composite >= 0.70 else Confidence.MEDIUM
 
     elif source == "smpl_mesh":
-        if frame_composite >= 0.70:
+        if effective_composite >= 0.70:
             conf = Confidence.HIGH
-        elif frame_composite >= 0.45:
+        elif effective_composite >= 0.45:
             conf = Confidence.MEDIUM
         else:
             conf = Confidence.LOW
@@ -124,6 +136,7 @@ def build_scan_measurements(
     landmark_visibilities: dict[str, float],  # "M01", "M26", … → visibility
     height_source: str = "user_input",
     height_confidence: Confidence = Confidence.HIGH,
+    mesh_fit_score: float = 1.0,
 ) -> ScanMeasurements:
     """
     Convert RawMeasurements + frame quality data into a scored ScanMeasurements.
@@ -135,6 +148,9 @@ def build_scan_measurements(
     height_source / height_confidence: when height was auto-estimated, all
     measurement fields are capped at height_confidence since every derived
     value inherits the scale-anchor uncertainty.
+
+    mesh_fit_score: silhouette IoU from F6 — gates maximum confidence for
+    SMPL-derived measurements when the mesh doesn't fit the actual body well.
     """
     conf_ceiling = height_confidence
 
@@ -142,7 +158,7 @@ def build_scan_measurements(
         source = raw.sources.get(key, "height_ratio")
         composite = _best_composite(key, frame_composites)
         vis = landmark_visibilities.get(key, 1.0)
-        field = score_field(value, source, composite, vis)
+        field = score_field(value, source, composite, vis, mesh_fit_score)
         # Every measurement is scaled by height_cm — propagate uncertainty
         if conf_ceiling != Confidence.HIGH:
             field = MeasurementField(

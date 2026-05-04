@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -110,8 +111,22 @@ class ScanPipeline:
             )
 
             mesh = self._fit_mesh(processed, height_est.value_cm)  # (verts, faces) or (None, None)
+
+            # F6: silhouette IoU between projected mesh and body mask
+            front_mask = next(
+                (p.body_mask for p in processed if p.pose_id == PoseID.FRONT), None
+            )
+            mesh_fit_score = self._compute_mesh_fit_score(
+                mesh[0] if mesh else None,
+                front_mask,
+                height_est.value_cm,
+            )
+            logger.info("Mesh fit score (silhouette IoU): %.3f", mesh_fit_score)
+
             raw  = self._extract_measurements(height_est.value_cm, processed, mesh)
-            measurements, conf = self._score(raw, processed, height_est.source, height_est.confidence)
+            measurements, conf = self._score(
+                raw, processed, height_est.source, height_est.confidence, mesh_fit_score
+            )
             validation = validate(measurements, height_est.value_cm)
 
             return ScanResponse(
@@ -241,15 +256,64 @@ class ScanPipeline:
         processed: list[_ProcessedFrame],
         height_source: str,
         height_confidence: Confidence,
+        mesh_fit_score: float = 1.0,
     ) -> tuple[ScanMeasurements, Confidence]:
         frame_composites = {p.pose_id.value: p.score.composite for p in processed}
         lm_vis = self._landmark_visibilities(processed)
 
         measurements = build_scan_measurements(
-            raw, frame_composites, lm_vis, height_source, height_confidence
+            raw, frame_composites, lm_vis, height_source, height_confidence,
+            mesh_fit_score=mesh_fit_score,
         )
         conf = overall_confidence(measurements)
         return measurements, conf
+
+    # ------------------------------------------------------------------
+    # Mesh fit score (F6) — silhouette IoU
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_mesh_fit_score(
+        vertices: Optional[np.ndarray],
+        body_mask: Optional[np.ndarray],
+        height_cm: float,
+    ) -> float:
+        """
+        IoU between the SMPL mesh's front-view convex-hull silhouette and the
+        segmenter body mask.  Returns 1.0 (no penalty) when either input is absent.
+
+        We use a convex hull approximation rather than full triangle rasterization;
+        it's fast (~1 ms) and sufficient to detect gross mesh mis-scale/placement.
+        """
+        if vertices is None or body_mask is None:
+            return 1.0
+
+        H, W = body_mask.shape[:2]
+        ys, xs = np.where(body_mask > 0)
+        if len(ys) == 0:
+            return 1.0
+
+        y_max = int(ys.max())
+        x_center = float(xs.mean())
+        mask_height_px = y_max - int(ys.min())
+        if mask_height_px < 10:
+            return 1.0
+
+        px_per_cm = mask_height_px / height_cm
+
+        # Project mesh (x, y) to pixel space: y=0 (feet) → y_max pixel row
+        vx = np.clip((vertices[:, 0] * px_per_cm + x_center).astype(np.int32), 0, W - 1)
+        vy = np.clip((y_max - vertices[:, 1] * px_per_cm).astype(np.int32), 0, H - 1)
+
+        pts = np.stack([vx, vy], axis=1)
+        hull = cv2.convexHull(pts)
+
+        silhouette = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(silhouette, hull, 255)
+
+        inter = int(np.count_nonzero((silhouette > 0) & (body_mask > 0)))
+        union = int(np.count_nonzero((silhouette > 0) | (body_mask > 0)))
+        return float(inter / union) if union > 0 else 1.0
 
     # ------------------------------------------------------------------
     # Helpers
