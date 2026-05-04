@@ -19,6 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 
 from app.measurement_engine.scan.job_store import job_store
 from app.measurement_engine.scan.pipeline import ScanPipeline
+from app.db.crud import save_profile_sync  # Firestore sync helper
 from app.measurement_engine.scan.garments import apply_garment_profile
 from app.measurement_engine.scan.schemas import (
     Confidence,
@@ -38,6 +39,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _CM_TO_IN = 0.393701
+
+
+# ---------------------------------------------------------------------------
+# Sync profile persistence helper (called from background thread)
+# ---------------------------------------------------------------------------
+
+def _persist_profile_sync(**kwargs) -> None:
+    """Thin wrapper: calls save_profile_sync and logs any error."""
+    try:
+        save_profile_sync(**kwargs)
+    except Exception as exc:
+        logger.error("Profile persistence failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +133,22 @@ def _run_pipeline_bg(
 
         job_store.update(session_id, status="COMPLETE", result=result, progress_pct=100)
         logger.info("Scan complete — session=%s confidence=%s", session_id, result.overall_confidence)
+
+        # A2: auto-persist when customer_id was supplied.
+        # Uses a synchronous SQLAlchemy session because this runs in a
+        # thread pool (sync background task) with no event loop.
+        if body.customer_id and result.measurements:
+            _persist_profile_sync(
+                customer_id=body.customer_id,
+                scan_id=result.scan_id,
+                height_cm=result.height_cm or 0.0,
+                height_source=result.height_source,
+                overall_confidence=result.overall_confidence.value,
+                measurements=result.measurements.model_dump(),
+                validation=result.validation.model_dump() if result.validation else None,
+                garment_type=result.garment_type.value if result.garment_type else None,
+                fit_style=result.fit_style.value if result.fit_style else None,
+            )
 
     except Exception as exc:
         logger.exception("Background pipeline failed for session %s", session_id)

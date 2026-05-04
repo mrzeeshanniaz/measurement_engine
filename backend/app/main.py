@@ -5,8 +5,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.db.firestore import dispose_firestore, init_firestore
 from app.measurement_engine.models.model_manager import ModelManager
-from app.api.v1 import scan
+from app.api.v1 import profiles, scan
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -18,12 +19,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting TailorSync Measurement Engine...")
+
+    # Firestore (optional — silently skipped when credentials are absent)
+    init_firestore()
+
     manager = ModelManager()
     await manager.load()
     app.state.models = manager
     logger.info("Models ready")
     yield
     await manager.unload()
+    await dispose_firestore()
     logger.info("Shutdown complete")
 
 
@@ -41,6 +47,7 @@ app.add_middleware(
 )
 
 app.include_router(scan.router, prefix="/api/v1/scan", tags=["Scan"])
+app.include_router(profiles.router, prefix="/api/v1/profiles", tags=["Profiles"])
 
 
 @app.get("/health")

@@ -95,6 +95,11 @@ class ScanSubmitRequest(BaseModel):
         None,
         description="UUID generated on-device at scan start (SCAN-10). Used for idempotency and abandoned-scan resume.",
     )
+    # A2: when provided the completed scan is persisted as a MeasurementProfile
+    customer_id: Optional[str] = Field(
+        None,
+        description="Opaque customer / user identifier. When set, the completed scan is automatically saved as a measurement profile.",
+    )
     height_cm: Optional[float] = Field(
         None, gt=50.0, lt=300.0,
         description=(
