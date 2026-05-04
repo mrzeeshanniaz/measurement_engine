@@ -18,10 +18,10 @@ class Settings(BaseSettings):
     # GCP project ID (optional — inferred from credentials when not set).
     FIREBASE_PROJECT_ID: Optional[str] = None
 
-    # JWT auth (A3) — required only when auth is enabled
-    JWT_SECRET_KEY: str = "change-me-in-production"
-    JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 60 * 24 * 7   # 1 week
+    # Firebase Auth (A3)
+    # AUTH_ENABLED=False in dev — unauthenticated requests are allowed.
+    # Set AUTH_ENABLED=True in production; tokens are verified via Firebase Admin SDK.
+    AUTH_ENABLED: bool = False
 
     class Config:
         env_file = ".env"

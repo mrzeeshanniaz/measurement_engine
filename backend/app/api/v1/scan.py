@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Literal
+from typing import Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+
+from app.auth import current_customer_id
 
 from app.measurement_engine.scan.job_store import job_store
 from app.measurement_engine.scan.pipeline import ScanPipeline
@@ -134,9 +136,7 @@ def _run_pipeline_bg(
         job_store.update(session_id, status="COMPLETE", result=result, progress_pct=100)
         logger.info("Scan complete — session=%s confidence=%s", session_id, result.overall_confidence)
 
-        # A2: auto-persist when customer_id was supplied.
-        # Uses a synchronous SQLAlchemy session because this runs in a
-        # thread pool (sync background task) with no event loop.
+            # A2: auto-persist when a customer_id is associated with this scan.
         if body.customer_id and result.measurements:
             _persist_profile_sync(
                 customer_id=body.customer_id,
@@ -172,6 +172,7 @@ async def submit_scan(
     body: ScanSubmitRequest,
     background_tasks: BackgroundTasks,
     units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements"),
+    token_uid: Optional[str] = Depends(current_customer_id),
 ) -> ScanSubmitResponse:
     """
     Accepts height + pose frames and queues the measurement pipeline.
@@ -180,10 +181,18 @@ async def submit_scan(
 
     **Idempotency:** if client_scan_id is supplied and the job already exists
     (e.g. after a retry), the existing job is returned without re-running.
+
+    **Persistence:** when a Firebase ID token is present the scan result is
+    automatically saved to Firestore under the token's UID (customer_id).
     """
     models = getattr(request.app.state, "models", None)
     if models is None or not models.is_loaded:
         raise HTTPException(status_code=503, detail="Models not ready")
+
+    # Token UID takes precedence over body.customer_id (prevents spoofing).
+    effective_customer_id = token_uid or body.customer_id
+    if effective_customer_id:
+        body = body.model_copy(update={"customer_id": effective_customer_id})
 
     # Use client-provided ID for idempotency; fall back to server-generated UUID.
     session_id = body.client_scan_id or str(uuid.uuid4())

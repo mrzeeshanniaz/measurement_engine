@@ -23,9 +23,6 @@ trimesh>=4.3.0
 # Firebase / Firestore (optional — persistence disabled when credentials are absent)
 firebase-admin>=6.5.0
 
-# Auth (A3)
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
 
 # Dev
 pytest>=8.2.0
