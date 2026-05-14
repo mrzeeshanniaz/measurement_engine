@@ -1,0 +1,40 @@
+# Local production-equivalent stack for the TailorSync engine.
+#
+# Bring up:   docker compose up --build
+# Tear down:  docker compose down
+#
+# Mounts the host's SMPL pkl files into the container read-only and persists
+# the SQLite job store in ./_data so restarts don't wipe pending scans.
+
+services:
+  engine:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: tailorsync-engine:latest
+    container_name: tailorsync-engine
+    ports:
+      - "8080:8080"
+    environment:
+      AUTH_ENABLED: "false"          # set to "true" + mount FIREBASE_CREDENTIALS_PATH for real auth
+      CORS_ORIGINS: "*"
+      DEBUG: "false"
+      JOB_STORE_BACKEND: "sqlite"
+      JOB_STORE_SQLITE_PATH: "/app/data/job_store.db"
+      MAX_REQUEST_BODY_BYTES: "94371840"   # 90 MB
+      RATE_LIMIT_SUBMIT: "30/minute"
+      RATE_LIMIT_MANUAL: "60/minute"
+    volumes:
+      # SMPL model weights are not baked into the image (license + size)
+      - ./backend/app/measurement_engine/smpl_anthropometry/data/smpl:/app/app/measurement_engine/smpl_anthropometry/data/smpl:ro
+      # Downloaded MediaPipe + segmenter files (~30 MB on first start)
+      - ./backend/models:/app/models
+      # Restart-safe job store
+      - ./_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped

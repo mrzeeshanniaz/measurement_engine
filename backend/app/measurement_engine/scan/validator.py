@@ -42,19 +42,11 @@ from app.measurement_engine.scan.schemas import (
     GarmentType,
     PoseID,
     ScanMeasurements,
+    Severity,
     ValidationIssue,
     ValidationResult,
 )
 from app.measurement_engine.scan.norms import NORMS, HARD_LIMITS
-
-
-# ---------------------------------------------------------------------------
-# Severity constants (mirror the string values in ValidationIssue)
-# ---------------------------------------------------------------------------
-
-class Severity:
-    ERROR   = "error"    # blocks order placement
-    WARNING = "warning"  # shown but does not block
 
 
 # Stitching-critical fields — LOW confidence on any of these blocks order (ORDER-03)
@@ -193,7 +185,7 @@ def _pass_norms(
 @dataclass
 class _Rule:
     code:         str
-    severity:     str
+    severity:     Severity
     message_tmpl: str   # uses {a}, {b}, {diff} placeholders
     fields:       list[str]
     rescan_poses: list[str]
@@ -629,7 +621,7 @@ def export_rules_for_frontend() -> dict:
     cross = [
         {
             "id":           r.code,
-            "severity":     r.severity,
+            "severity":     r.severity.value,
             "fields":       r.fields,
             "description":  r.message_tmpl,
             "suggestion":   r.suggestion,

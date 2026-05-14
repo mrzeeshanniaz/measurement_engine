@@ -88,6 +88,20 @@ class PoseFrame(BaseModel):
         description="On-device frame quality score reported by the mobile app",
     )
 
+    @field_validator("image_b64")
+    @classmethod
+    def _enforce_max_size(cls, v: str) -> str:
+        # Lazy import to avoid pulling settings at module import time.
+        # We only enforce the maximum here — the real image-decode happens in
+        # the pipeline, which raises on malformed/tiny inputs naturally.
+        from app.config import settings
+
+        if len(v) > settings.MAX_FRAME_B64_BYTES:
+            raise ValueError(
+                f"image_b64 exceeds maximum of {settings.MAX_FRAME_B64_BYTES} bytes"
+            )
+        return v
+
 
 class ScaleTier(str, Enum):
     """Processing quality tier sent by the mobile client."""
@@ -281,8 +295,13 @@ class ScanStatusResponse(BaseModel):
 # Validation result (returned alongside measurements in ScanResponse)
 # ---------------------------------------------------------------------------
 
+class Severity(str, Enum):
+    ERROR   = "error"    # blocks order placement
+    WARNING = "warning"  # advisory only
+
+
 class ValidationIssue(BaseModel):
-    severity: str = Field(..., description="'error' (blocks order) or 'warning' (advisory)")
+    severity: Severity = Field(..., description="ERROR blocks order placement; WARNING is advisory only")
     code: str = Field(..., description="Machine-readable rule ID for Flutter localisation")
     message: str = Field(..., description="Human-readable explanation with actual values")
     fields: list[str] = Field(default_factory=list, description="Measurement codes involved")
@@ -299,11 +318,11 @@ class ValidationResult(BaseModel):
 
     @property
     def errors(self) -> list[ValidationIssue]:
-        return [i for i in self.issues if i.severity == "error"]
+        return [i for i in self.issues if i.severity == Severity.ERROR]
 
     @property
     def warnings(self) -> list[ValidationIssue]:
-        return [i for i in self.issues if i.severity == "warning"]
+        return [i for i in self.issues if i.severity == Severity.WARNING]
 
 
 class ScanResponse(BaseModel):

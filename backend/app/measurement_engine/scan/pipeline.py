@@ -114,18 +114,22 @@ class ScanPipeline:
                 height_est.value_cm, height_est.source, height_est.confidence,
             )
 
-            mesh = self._fit_mesh(processed, height_est.value_cm)  # (verts, faces) or (None, None)
+            mesh = self._fit_mesh(processed, height_est.value_cm)  # (verts, faces) or None
 
-            # F6: silhouette IoU between projected mesh and body mask
-            front_mask = next(
-                (p.body_mask for p in processed if p.pose_id == PoseID.FRONT), None
-            )
+            # F6: silhouette IoU between projected mesh and per-view body masks
             mesh_fit_score = self._compute_mesh_fit_score(
                 mesh[0] if mesh else None,
-                front_mask,
+                processed,
                 height_est.value_cm,
             )
             logger.info("Mesh fit score (silhouette IoU): %.3f", mesh_fit_score)
+
+            # Surface to Prometheus when metrics are enabled (no-op if absent).
+            try:
+                from app.metrics import mesh_fit_iou
+                mesh_fit_iou.observe(mesh_fit_score)
+            except Exception:
+                pass
 
             raw  = self._extract_measurements(height_est.value_cm, processed, mesh)
             measurements, conf = self._score(
@@ -241,12 +245,12 @@ class ScanPipeline:
                 back_mask=back_mask,
             )
             if mesh_result is None:
-                return None, None
+                return None
 
             return mesh_result.vertices, mesh_result.faces
         except Exception as e:
             logger.warning("SMPL fitting failed: %s", e)
-            return None, None
+            return None
 
     # ------------------------------------------------------------------
     # Step 3 — extract raw measurements
@@ -306,35 +310,77 @@ class ScanPipeline:
     @staticmethod
     def _compute_mesh_fit_score(
         vertices: Optional[np.ndarray],
-        body_mask: Optional[np.ndarray],
+        processed: list[_ProcessedFrame],
         height_cm: float,
     ) -> float:
         """
-        IoU between the SMPL mesh's front-view convex-hull silhouette and the
-        segmenter body mask.  Returns 1.0 (no penalty) when either input is absent.
+        IoU between the SMPL mesh's convex-hull silhouette and the segmenter
+        body masks across available views.  Returns the mean IoU over (front,
+        side_left, back), using only views whose mask is present.
 
-        We use a convex hull approximation rather than full triangle rasterization;
-        it's fast (~1 ms) and sufficient to detect gross mesh mis-scale/placement.
+        Returns 1.0 (no penalty) when vertices or all masks are absent.
+
+        We use a convex-hull approximation rather than full triangle
+        rasterization; it's fast (~1 ms per view) and sufficient to detect
+        gross mesh mis-scale / mis-placement that would invalidate
+        depth-derived measurements.
         """
-        if vertices is None or body_mask is None:
+        if vertices is None:
             return 1.0
 
-        H, W = body_mask.shape[:2]
+        # (pose, projection axes) — front/back share (x,y); side uses (z,y)
+        views = [
+            (PoseID.FRONT,     (0, 1)),
+            (PoseID.SIDE_LEFT, (2, 1)),
+            (PoseID.BACK,      (0, 1)),
+        ]
+
+        ious: list[float] = []
+        for pose, (h_axis, v_axis) in views:
+            frame = next((p for p in processed if p.pose_id == pose), None)
+            if frame is None or frame.body_mask is None:
+                continue
+            iou = ScanPipeline._silhouette_iou(
+                vertices, frame.body_mask, height_cm, h_axis, v_axis
+            )
+            if iou is not None:
+                ious.append(iou)
+
+        return float(np.mean(ious)) if ious else 1.0
+
+    @staticmethod
+    def _silhouette_iou(
+        vertices: np.ndarray,
+        body_mask: np.ndarray,
+        height_cm: float,
+        h_axis: int,
+        v_axis: int,
+    ) -> Optional[float]:
+        """One-view silhouette IoU between the mesh convex hull and a body mask."""
+        # Some segmenters emit (H, W, 1) — collapse to 2D so np.where unpacks cleanly.
+        if body_mask.ndim == 3:
+            body_mask = body_mask.squeeze(-1)
+        if body_mask.ndim != 2:
+            return None
+        H, W = body_mask.shape
         ys, xs = np.where(body_mask > 0)
         if len(ys) == 0:
-            return 1.0
+            return None
 
         y_max = int(ys.max())
         x_center = float(xs.mean())
         mask_height_px = y_max - int(ys.min())
         if mask_height_px < 10:
-            return 1.0
+            return None
 
         px_per_cm = mask_height_px / height_cm
 
-        # Project mesh (x, y) to pixel space: y=0 (feet) → y_max pixel row
-        vx = np.clip((vertices[:, 0] * px_per_cm + x_center).astype(np.int32), 0, W - 1)
-        vy = np.clip((y_max - vertices[:, 1] * px_per_cm).astype(np.int32), 0, H - 1)
+        vx = np.clip(
+            (vertices[:, h_axis] * px_per_cm + x_center).astype(np.int32), 0, W - 1
+        )
+        vy = np.clip(
+            (y_max - vertices[:, v_axis] * px_per_cm).astype(np.int32), 0, H - 1
+        )
 
         pts = np.stack([vx, vy], axis=1)
         hull = cv2.convexHull(pts)
@@ -344,7 +390,7 @@ class ScanPipeline:
 
         inter = int(np.count_nonzero((silhouette > 0) & (body_mask > 0)))
         union = int(np.count_nonzero((silhouette > 0) | (body_mask > 0)))
-        return float(inter / union) if union > 0 else 1.0
+        return float(inter / union) if union > 0 else None
 
     # ------------------------------------------------------------------
     # Helpers

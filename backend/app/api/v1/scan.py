@@ -11,6 +11,7 @@ GET  /api/v1/scan/health          — pipeline liveness check
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from typing import Literal, Optional
@@ -18,6 +19,14 @@ from typing import Literal, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
 from app.auth import current_customer_id
+from app.config import settings
+from app.metrics import (
+    overall_confidence_total,
+    pipeline_seconds,
+    scan_completed_total,
+    scan_submitted_total,
+)
+from app.rate_limit import limiter
 
 from app.measurement_engine.scan.job_store import job_store
 from app.measurement_engine.scan.pipeline import ScanPipeline
@@ -40,7 +49,8 @@ from app.measurement_engine.scan.validator import export_rules_for_frontend, val
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_CM_TO_IN = 0.393701
+_CM_TO_IN = 1.0 / 2.54   # 0.39370078… — keep the inverse exact via 2.54
+_IN_TO_CM = 2.54
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +81,7 @@ def _convert_measurements(
         return resp.model_copy(update={"response_unit": target_unit, "height_cm": new_height})
 
     converted: dict = {}
-    for fname in resp.measurements.model_fields:
+    for fname in ScanMeasurements.model_fields:
         mf: MeasurementField = getattr(resp.measurements, fname)
         new_val     = round(mf.value_cm        * factor, 2) if mf.value_cm        is not None else None
         new_ease    = round(mf.ease_cm         * factor, 2) if mf.ease_cm         is not None else None
@@ -97,7 +107,7 @@ def _to_inches(resp: ScanResponse) -> ScanResponse:
 
 def _to_cm(resp: ScanResponse) -> ScanResponse:
     """Return a copy of resp with all measurement values converted back to cm."""
-    return _convert_measurements(resp, 1.0 / _CM_TO_IN, "cm")
+    return _convert_measurements(resp, _IN_TO_CM, "cm")
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +127,9 @@ def _run_pipeline_bg(
     BackgroundTasks.  Updates job_store at each stage so /status reflects
     live progress.
     """
+    import time as _time
     job_store.update(session_id, status="PROCESSING", progress_pct=10)
+    started_at = _time.monotonic()
     try:
         pipeline = ScanPipeline(
             pose_model=pose_model,
@@ -133,9 +145,11 @@ def _run_pipeline_bg(
             garment_type=body.garment_type,
             fit_style=body.fit_style,
         )
+        pipeline_seconds.observe(_time.monotonic() - started_at)
         job_store.update(session_id, progress_pct=90)
 
         if result.status == ScanStatus.FAILED:
+            scan_completed_total.labels(status="failed").inc()
             job_store.update(
                 session_id,
                 status="FAILED",
@@ -147,6 +161,8 @@ def _run_pipeline_bg(
         if units == "in":
             result = _to_inches(result)
 
+        scan_completed_total.labels(status="complete").inc()
+        overall_confidence_total.labels(level=result.overall_confidence.value).inc()
         job_store.update(session_id, status="COMPLETE", result=result, progress_pct=100)
         logger.info("Scan complete — session=%s confidence=%s", session_id, result.overall_confidence)
 
@@ -178,9 +194,11 @@ def _run_pipeline_bg(
     response_model=ScanSubmitResponse,
     summary="Queue a body scan for measurement extraction",
     responses={
+        429: {"description": "Rate limit exceeded"},
         503: {"description": "Models not yet loaded"},
     },
 )
+@limiter.limit(lambda: settings.RATE_LIMIT_SUBMIT)
 async def submit_scan(
     request: Request,
     body: ScanSubmitRequest,
@@ -209,18 +227,35 @@ async def submit_scan(
         body = body.model_copy(update={"customer_id": effective_customer_id})
 
     # Use client-provided ID for idempotency; fall back to server-generated UUID.
-    session_id = body.client_scan_id or str(uuid.uuid4())
+    # Namespace under customer_id so two authenticated users cannot collide on
+    # the same client_scan_id and read each other's job state. The hash keeps
+    # session IDs opaque on the wire (the UID is not exposed in the URL).
+    if body.client_scan_id:
+        if effective_customer_id:
+            session_id = hashlib.sha256(
+                f"{effective_customer_id}:{body.client_scan_id}".encode("utf-8")
+            ).hexdigest()
+        else:
+            session_id = body.client_scan_id
+    else:
+        session_id = str(uuid.uuid4())
 
     existing = job_store.get(session_id)
     if existing is not None:
         # Idempotent retry — return the in-flight or completed job.
+        # If the existing job is owned by a different customer, treat it as
+        # not-found rather than leaking its existence.
+        if existing.customer_id and existing.customer_id != effective_customer_id:
+            raise HTTPException(status_code=404, detail="Session not found.")
+        scan_submitted_total.labels(idempotent_replay="true").inc()
         logger.info("Idempotent resubmit — session=%s status=%s", session_id, existing.status)
         return ScanSubmitResponse(
             session_id=session_id,
             client_scan_id=body.client_scan_id,
         )
 
-    job_store.create(session_id)
+    job_store.create(session_id, customer_id=effective_customer_id)
+    scan_submitted_total.labels(idempotent_replay="false").inc()
     logger.info(
         "Scan queued — session=%s height=%s frames=%d",
         session_id,
@@ -256,7 +291,10 @@ async def submit_scan(
         404: {"description": "Session not found or expired (TTL 1 h)"},
     },
 )
-async def scan_status(session_id: str) -> ScanStatusResponse:
+async def scan_status(
+    session_id: str,
+    token_uid: Optional[str] = Depends(current_customer_id),
+) -> ScanStatusResponse:
     """
     Returns the current job status.  Poll every 2 seconds.
 
@@ -268,7 +306,7 @@ async def scan_status(session_id: str) -> ScanStatusResponse:
     | `FAILED`     | Pipeline error — error field contains detail|
     """
     job = job_store.get(session_id)
-    if job is None:
+    if job is None or (job.customer_id and job.customer_id != token_uid):
         raise HTTPException(
             status_code=404,
             detail=f"Session '{session_id}' not found or expired.",
@@ -298,6 +336,7 @@ async def scan_status(session_id: str) -> ScanStatusResponse:
 async def scan_result(
     session_id: str,
     units: Literal["cm", "in"] = Query("cm", description="Response unit (result was stored in the unit requested at submit time; this overrides if different)"),
+    token_uid: Optional[str] = Depends(current_customer_id),
 ) -> ScanResponse:
     """
     Returns the full 32-measurement ScanResponse.  Only call after
@@ -306,7 +345,7 @@ async def scan_result(
     The units query param can override the unit requested at submit time.
     """
     job = job_store.get(session_id)
-    if job is None:
+    if job is None or (job.customer_id and job.customer_id != token_uid):
         raise HTTPException(
             status_code=404,
             detail=f"Session '{session_id}' not found or expired.",
@@ -344,8 +383,11 @@ async def scan_result(
     "/manual",
     response_model=ScanResponse,
     summary="Submit all 32 measurements entered manually (SCAN-09)",
+    responses={429: {"description": "Rate limit exceeded"}},
 )
+@limiter.limit(lambda: settings.RATE_LIMIT_MANUAL)
 async def submit_manual(
+    request: Request,
     body: ManualMeasurementRequest,
     units: Literal["cm", "in"] = Query("cm", description="Response unit for all measurements"),
 ) -> ScanResponse:
@@ -461,18 +503,55 @@ async def validation_rules() -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/health", summary="Pipeline health check")
-async def scan_health(request: Request) -> dict:
+async def scan_health(request: Request):
+    """
+    Reports pipeline readiness with explicit degraded-mode signalling.
+
+    Status values:
+      - "ok"        : all models loaded, full feature set
+      - "degraded"  : pipeline can still produce measurements but at reduced
+                      quality (e.g. segmenter is in fallback so no body masks)
+      - "unready"   : critical model(s) absent — pipeline cannot run
+    """
+    from fastapi import Response
+
     models = getattr(request.app.state, "models", None)
     seg = getattr(models, "segmenter", None) if models else None
+
+    pose_ok    = bool(models and models.pose.is_loaded)
+    smpl_ok    = bool(models and models.smpl.is_loaded)
+    # MediaPipeSegmenter sets is_loaded=True even in fallback mode (it always
+    # answers segment() with None then). Detect the real degraded mode here.
+    seg_real   = bool(seg and seg.is_loaded and not getattr(seg, "_fallback", False))
+    seg_loaded = bool(seg and seg.is_loaded)
+
+    if not (pose_ok and smpl_ok):
+        status_label = "unready"
+        http_status  = 503
+    elif not seg_real:
+        # No body masks — mesh-fit IoU gate is disabled, depth measurements
+        # are less reliable. Still serviceable but flagged.
+        status_label = "degraded"
+        http_status  = 200
+    else:
+        status_label = "ok"
+        http_status  = 200
+
     job_counts = job_store.counts()
-    return {
-        "pipeline": "ok",
-        "models_loaded": models.is_loaded if models else False,
-        "pose_model": models.pose.is_loaded if models else False,
-        "segmenter_model": seg.is_loaded if seg else False,
-        "smpl_model": models.smpl.is_loaded if models else False,
+    payload = {
+        "pipeline": status_label,
+        "models_loaded": pose_ok and smpl_ok,
+        "pose_model": pose_ok,
+        "segmenter_model": seg_loaded,
+        "segmenter_real": seg_real,    # False when running in fallback
+        "smpl_model": smpl_ok,
         "jobs_queued": job_counts["QUEUED"],
         "jobs_processing": job_counts["PROCESSING"],
         "jobs_complete": job_counts["COMPLETE"],
         "jobs_failed": job_counts["FAILED"],
     }
+    return Response(
+        content=__import__("json").dumps(payload),
+        status_code=http_status,
+        media_type="application/json",
+    )

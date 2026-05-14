@@ -561,7 +561,10 @@ class MeasurementExtractor:
         return self._smpl_anthro_or("M01_chest", _fallback)
 
     def _under_bust_circ(self) -> tuple[Optional[float], str]:
-        v = self._mesh_circumference_at_height_ratio(0.73)
+        # The under-bust band sits below the breast at ~70% of standing height,
+        # noticeably below the chest line (0.76). Sampling at 0.73 caught the
+        # bust itself and produced |Z|≈3.3 against the norm in the proof run.
+        v = self._mesh_circumference_at_height_ratio(0.70)
         if v:
             return apply_clothing_compensation(v, "under_bust"), "smpl_mesh"
         return self._ratio_fallback("under_bust_circ")
@@ -673,7 +676,10 @@ class MeasurementExtractor:
         ls = self.front.get(_L.L_SHOULDER)
         la = self.front.get(_L.L_ANKLE)
         if ls and la and ls.visibility > 0.5 and la.visibility > 0.5:
-            dist = self._lm_dist_y(ls, la) * 0.95
+            # Shoulder→ankle spans ≈ 86% of height; ANSUR-II "dress length" lands
+            # near mid-calf (≈ 67% of height). 0.78 of shoulder→ankle ≈ 67% of height,
+            # matching both the norm and the height-ratio fallback (0.680).
+            dist = self._lm_dist_y(ls, la) * 0.78
             return round(dist, 1), "landmark"
         return self._ratio_fallback("dress_length")
 
@@ -695,14 +701,17 @@ class MeasurementExtractor:
         return self._smpl_anthro_or("M19_sleeve_length", _fallback)
 
     def _sleeve_length_elbow(self) -> tuple[Optional[float], str]:
-        src = self.arms or self.front
-        ls = src.get(_L.L_SHOULDER)
-        le = src.get(_L.L_ELBOW)
-        if ls and le and ls.visibility > 0.5 and le.visibility > 0.5:
-            dx = (ls.x - le.x) * self._px_to_cm
-            dy = (ls.y - le.y) * self._px_to_cm
-            dist = round(float(np.sqrt(dx ** 2 + dy ** 2)), 1)
-            return dist, "landmark"
+        # Mirror the M19 fix: only use the arms-out pose. With arms at sides,
+        # shoulder→elbow projects onto a vertical line and overstates length.
+        src = self.arms
+        if src:
+            ls = src.get(_L.L_SHOULDER)
+            le = src.get(_L.L_ELBOW)
+            if ls and le and ls.visibility > 0.5 and le.visibility > 0.5:
+                dx = (ls.x - le.x) * self._px_to_cm
+                dy = (ls.y - le.y) * self._px_to_cm
+                dist = round(float(np.sqrt(dx ** 2 + dy ** 2)), 1)
+                return dist, "landmark"
         return self._ratio_fallback("sleeve_elbow")
 
     def _inseam(self) -> tuple[Optional[float], str]:
@@ -721,26 +730,23 @@ class MeasurementExtractor:
         return self._ratio_fallback("outseam")
 
     def _crotch_depth_front(self) -> tuple[Optional[float], str]:
-        # PRD M23: waist-to-crotch (front rise). No direct crotch landmark in
-        # MediaPipe; the mesh can give the waist-to-hip vertical drop which is
-        # the closest computable proxy. Landmark torso-fraction formulas produce
-        # ~14 cm when the expected value is ~29 cm — use height_ratio as fallback.
-        if self.mesh is not None and self._mesh_scale is not None:
-            # Waist at ~0.62, hip/crotch at ~0.52 → delta × height
-            waist_depth = self._mesh_depth_at_height_ratio(0.62)
-            hip_depth   = self._mesh_depth_at_height_ratio(0.52)
-            if waist_depth and hip_depth:
-                rise = round((0.62 - 0.52) * self.height_cm, 1)
-                return rise, "smpl_mesh"
-        return self._ratio_fallback("crotch_front")
+        # PRD M23: front rise (waist to crotch along body). No crotch landmark in
+        # MediaPipe and the body mesh has no annotated crotch vertex either.
+        # SMPL-Anthropometry exposes a calibrated rise; otherwise fall back to
+        # the height-ratio estimate.
+        return self._smpl_anthro_or(
+            "M23_crotch_depth_front",
+            lambda: self._ratio_fallback("crotch_front"),
+        )
 
     def _crotch_depth_back(self) -> tuple[Optional[float], str]:
-        # Back rise is slightly longer than front rise (typically +0.5–1 cm)
-        if self.mesh is not None:
-            rise, source = self._crotch_depth_front()
-            if rise is not None:
-                return round(rise * 1.04, 1), source
-        return self._ratio_fallback("crotch_back")
+        # Back rise typically 4% longer than front rise.
+        def _fallback() -> tuple[Optional[float], str]:
+            front, source = self._crotch_depth_front()
+            if front is not None and source != "height_ratio":
+                return round(front * 1.04, 1), source
+            return self._ratio_fallback("crotch_back")
+        return self._smpl_anthro_or("M24_crotch_depth_back", _fallback)
 
     def _torso_length(self) -> tuple[Optional[float], str]:
         def _fallback():
@@ -776,7 +782,10 @@ class MeasurementExtractor:
         return self._smpl_anthro_or("M26_shoulder_width", _fallback)
 
     def _chest_width(self) -> tuple[Optional[float], str]:
-        v = self._mesh_width_at_height_ratio(0.76)
+        # Standing-body proportions place shoulders at ratio ~0.82 and the chest
+        # at ~0.72. Sampling at 0.76 (chest *circ* height) catches the broader
+        # shoulder span; 0.72 gives a chest-only frontal width.
+        v = self._mesh_width_at_height_ratio(0.72)
         if v:
             return v, "smpl_mesh"
         sw, _ = self._shoulder_width()
@@ -810,11 +819,9 @@ class MeasurementExtractor:
         v = self._mesh_depth_at_height_ratio(0.76)
         if v:
             return v, "smpl_mesh"
-        # From side frame: chest width in side view ≈ chest depth
-        ls = self.side.get(_L.L_SHOULDER)
-        rs = self.side.get(_L.R_SHOULDER)
-        if ls and rs and ls.visibility > 0.5 and rs.visibility > 0.5:
-            return round(self._lm_dist_x(ls, rs), 1), "landmark"
+        # In a strict side profile, L_SHOULDER and R_SHOULDER collapse to roughly
+        # the same image point, so neither X nor Y distance approximates depth.
+        # There is no reliable single-landmark proxy — go straight to height_ratio.
         return self._ratio_fallback("chest_depth")
 
     def _waist_depth(self) -> tuple[Optional[float], str]:

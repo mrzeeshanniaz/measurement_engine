@@ -159,6 +159,7 @@ EASE_ALLOWANCES: dict[str, dict[FitStyle, float]] = {
     "M12": {FitStyle.FITTED: 2.0,  FitStyle.REGULAR: 3.0,  FitStyle.RELAXED: 5.0},   # calf
 
     # Widths ---------------------------------------------------------------
+    "M26": {FitStyle.FITTED: 0.5,  FitStyle.REGULAR: 1.0,  FitStyle.RELAXED: 2.0},   # shoulder width
     "M27": {FitStyle.FITTED: 0.5,  FitStyle.REGULAR: 1.5,  FitStyle.RELAXED: 3.0},   # chest width
     "M28": {FitStyle.FITTED: 0.5,  FitStyle.REGULAR: 1.5,  FitStyle.RELAXED: 3.0},   # back width
     "M29": {FitStyle.FITTED: 0.5,  FitStyle.REGULAR: 1.0,  FitStyle.RELAXED: 2.0},   # hip width
@@ -166,9 +167,13 @@ EASE_ALLOWANCES: dict[str, dict[FitStyle, float]] = {
     # Depths ---------------------------------------------------------------
     "M32": {FitStyle.FITTED: 1.0,  FitStyle.REGULAR: 1.5,  FitStyle.RELAXED: 2.0},   # armhole depth
 
-    # Hem allowance (lengths get +2 cm for a standard hem regardless of fit style)
+    # Length hem allowances (independent of fit style — fabric needed for the hem)
     "M17": {FitStyle.FITTED: 2.0,  FitStyle.REGULAR: 2.0,  FitStyle.RELAXED: 2.0},   # kameez length
     "M18": {FitStyle.FITTED: 2.0,  FitStyle.REGULAR: 2.0,  FitStyle.RELAXED: 2.0},   # dress length
+    "M19": {FitStyle.FITTED: 2.5,  FitStyle.REGULAR: 2.5,  FitStyle.RELAXED: 2.5},   # sleeve length (full)
+    "M20": {FitStyle.FITTED: 2.0,  FitStyle.REGULAR: 2.0,  FitStyle.RELAXED: 2.0},   # sleeve length (elbow)
+    "M21": {FitStyle.FITTED: 3.0,  FitStyle.REGULAR: 3.0,  FitStyle.RELAXED: 3.0},   # inseam hem
+    "M22": {FitStyle.FITTED: 3.0,  FitStyle.REGULAR: 3.0,  FitStyle.RELAXED: 3.0},   # outseam hem
 }
 
 
@@ -198,19 +203,22 @@ def apply_garment_profile(
     required_codes = GARMENT_REQUIRED_FIELDS.get(garment_type, set())
     updated: dict[str, MeasurementField] = {}
 
-    for attr_name in measurements.model_fields:
+    for attr_name in ScanMeasurements.model_fields:
         field: MeasurementField = getattr(measurements, attr_name)
         code = attr_name.split("_")[0]   # "M01_chest" → "M01"
 
         required = code in required_codes
 
+        # cutting_value_cm and ease_cm are only set when the measurement actually
+        # has an ease entry for this fit_style. M14 (height) and fields with no
+        # ease are not "cut to" a dimension, so both stay None.
         ease_cm: Optional[float] = None
         cutting_value_cm: Optional[float] = None
         if fit_style is not None and field.value_cm is not None:
-            ease = EASE_ALLOWANCES.get(code, {}).get(fit_style, 0.0)
-            if ease != 0.0:
+            ease = EASE_ALLOWANCES.get(code, {}).get(fit_style)
+            if ease is not None:
                 ease_cm = round(ease, 1)
-            cutting_value_cm = round(field.value_cm + ease, 1)
+                cutting_value_cm = round(field.value_cm + ease, 1)
 
         updated[attr_name] = field.model_copy(update={
             "is_required_for_garment": required,

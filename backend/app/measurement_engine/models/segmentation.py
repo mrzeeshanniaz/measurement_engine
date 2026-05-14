@@ -81,8 +81,13 @@ class MediaPipeSegmenter:
             if not result.confidence_masks:
                 return None
 
-            # confidence_masks[0] is the foreground (person) confidence: (H, W) float32
-            conf_map = result.confidence_masks[0].numpy_view()
+            # confidence_masks[0] is the foreground (person) confidence map.
+            # Some MediaPipe builds return (H, W, 1) instead of (H, W); squeeze
+            # to guarantee a 2D mask so downstream IoU code (which expects 2D)
+            # never errors with "too many values to unpack".
+            conf_map = np.asarray(result.confidence_masks[0].numpy_view())
+            if conf_map.ndim == 3:
+                conf_map = conf_map.squeeze(-1)
             return (conf_map > _CONF_THRESHOLD).astype(np.uint8) * 255
         except Exception as exc:
             logger.error("Segmentation failed: %s", exc)
