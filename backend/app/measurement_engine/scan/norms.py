@@ -100,6 +100,7 @@ HARD_LIMITS: dict[str, tuple[float, float]] = {
     "M11": (18.0,   80.0),
     "M12": (15.0,   70.0),
     "M13": (12.0,   50.0),
+    "M14": (100.0, 250.0),  # Total height (cm) — physiological adult range
     "M15": (20.0,   60.0),
     "M16": (18.0,   58.0),
     "M17": (50.0,  150.0),

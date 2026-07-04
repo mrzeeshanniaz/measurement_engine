@@ -20,6 +20,14 @@ torchvision>=0.18.0
 smplx>=0.1.28
 trimesh>=4.3.0
 
+# Firebase / Firestore (optional — persistence disabled when credentials are absent)
+firebase-admin>=6.5.0
+
+# Production hardening
+slowapi>=0.1.9              # per-IP rate limiting
+prometheus_client>=0.20.0   # /metrics endpoint
+gunicorn>=22.0.0            # production WSGI/ASGI runner
+
 # Dev
 pytest>=8.2.0
 httpx>=0.27.0

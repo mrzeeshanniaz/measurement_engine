@@ -21,13 +21,16 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
 from app.measurement_engine.scan.schemas import (
     CameraMetadata,
     Confidence,
+    FitStyle,
     FrameScore,
+    GarmentType,
     PoseFrame,
     PoseID,
     ScanMeasurements,
@@ -57,6 +60,7 @@ class _ProcessedFrame:
     image: Image.Image
     landmarks: Optional[dict[int, LandmarkPoint]]
     score: FrameScore
+    body_mask: Optional[np.ndarray] = None   # uint8 (H,W): 255=person, 0=bg
 
 
 class ScanPipeline:
@@ -65,15 +69,17 @@ class ScanPipeline:
     wrappers are injected from app.state to avoid reloading between requests.
     """
 
-    def __init__(self, pose_model, smpl_model):
+    def __init__(self, pose_model, smpl_model, segmenter_model=None):
         """
         Args:
-            pose_model:  MediaPipePoseWrapper instance (already loaded).
-            smpl_model:  SMPLFitter instance (already loaded).
+            pose_model:       MediaPipePoseWrapper instance (already loaded).
+            smpl_model:       SMPLFitter instance (already loaded).
+            segmenter_model:  MediaPipeSegmenter instance (optional; may be None).
         """
-        self._pose      = pose_model
-        self._smpl      = smpl_model
-        self._scorer    = FrameScorer()
+        self._pose       = pose_model
+        self._smpl       = smpl_model
+        self._segmenter  = segmenter_model
+        self._scorer     = FrameScorer()
         self._height_est = HeightEstimator()
 
     # ------------------------------------------------------------------
@@ -85,6 +91,8 @@ class ScanPipeline:
         frames: list[PoseFrame],
         height_cm: Optional[float] = None,
         camera_metadata: Optional[CameraMetadata] = None,
+        garment_type: Optional[GarmentType] = None,
+        fit_style: Optional[FitStyle] = None,
     ) -> ScanResponse:
         scan_id = str(uuid.uuid4())
 
@@ -106,10 +114,36 @@ class ScanPipeline:
                 height_est.value_cm, height_est.source, height_est.confidence,
             )
 
-            mesh = self._fit_mesh(processed, height_est.value_cm)  # (verts, faces) or (None, None)
+            mesh = self._fit_mesh(processed, height_est.value_cm)  # (verts, faces) or None
+
+            # F6: silhouette IoU between projected mesh and per-view body masks
+            mesh_fit_score = self._compute_mesh_fit_score(
+                mesh[0] if mesh else None,
+                processed,
+                height_est.value_cm,
+            )
+            logger.info("Mesh fit score (silhouette IoU): %.3f", mesh_fit_score)
+
+            # Surface to Prometheus when metrics are enabled (no-op if absent).
+            try:
+                from app.metrics import mesh_fit_iou
+                mesh_fit_iou.observe(mesh_fit_score)
+            except Exception:
+                pass
+
             raw  = self._extract_measurements(height_est.value_cm, processed, mesh)
-            measurements, conf = self._score(raw, processed, height_est.source, height_est.confidence)
-            validation = validate(measurements, height_est.value_cm)
+            measurements, conf = self._score(
+                raw, processed, height_est.source, height_est.confidence, mesh_fit_score
+            )
+
+            # F8/F9: mark required fields and compute ease / cutting dimensions
+            from app.measurement_engine.scan.garments import apply_garment_profile
+            measurements = apply_garment_profile(measurements, garment_type, fit_style)
+
+            validation = validate(
+                measurements, height_est.value_cm, garment_type,
+                mesh_fit_score=mesh_fit_score,
+            )
 
             return ScanResponse(
                 scan_id=scan_id,
@@ -120,6 +154,8 @@ class ScanPipeline:
                 height_source=height_est.source,
                 measurements=measurements,
                 validation=validation,
+                garment_type=garment_type,
+                fit_style=fit_style,
             )
 
         except Exception as exc:
@@ -140,19 +176,25 @@ class ScanPipeline:
         processed: list[_ProcessedFrame] = []
         for pf in frames:
             img = self._decode_image(pf.image_b64)
+
+            # Body segmentation (optional — None when segmenter is unavailable)
+            mask = self._segmenter.segment(img) if self._segmenter else None
+
             raw_lm = self._pose.detect_landmarks(img)
             lm = self._convert_landmarks(raw_lm)
-            score = self._scorer.score(img, pf.pose_id, lm)
+            score = self._scorer.score(img, pf.pose_id, lm, body_mask=mask)
             processed.append(_ProcessedFrame(
                 pose_id=pf.pose_id,
                 image=img,
                 landmarks=lm,
                 score=score,
+                body_mask=mask,
             ))
             logger.debug(
-                "Frame %s scored %.2f (blur=%.2f pose=%.2f angle=%.2f)",
+                "Frame %s scored %.2f (blur=%.2f pose=%.2f angle=%.2f occ=%.2f)",
                 pf.pose_id, score.composite,
                 score.blur_score, score.pose_confidence, score.angle_match,
+                score.occlusion_score,
             )
         return processed
 
@@ -166,32 +208,49 @@ class ScanPipeline:
         height_cm: float,
     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
         """
-        Attempt multi-view SMPL mesh fitting.
-        Falls back to single-view if only one usable frame exists.
-        Returns scaled mesh vertices (N, 3) or None.
+        B8: Multi-view SMPL mesh fitting.
+
+        Collects body masks from all available poses (front, side, back) and
+        passes them to fit_multiview() for silhouette-IoU-guided beta refinement.
+        Falls back gracefully when masks or extra views are absent.
         """
         usable = [p for p in processed if p.score.is_usable]
         if not usable:
             logger.warning("No usable frames for mesh fitting — using landmark-only path")
             return None
 
-        # Prefer FRONT frame as primary
-        primary = self._get_frame(usable, PoseID.FRONT) or usable[0]
+        front_lm = self._landmarks_for(processed, PoseID.FRONT)
+
+        # Gather body masks per view for multi-view silhouette optimization
+        def _mask_for(pose: PoseID) -> Optional[np.ndarray]:
+            frame = self._get_frame(processed, pose)
+            return frame.body_mask if frame else None
+
+        front_mask = _mask_for(PoseID.FRONT)
+        side_mask  = _mask_for(PoseID.SIDE_LEFT)
+        back_mask  = _mask_for(PoseID.BACK)
+
+        n_views = sum(m is not None for m in (front_mask, side_mask, back_mask))
+        logger.info(
+            "SMPL fit: height=%.1f cm, landmark_views=1, mask_views=%d",
+            height_cm, n_views,
+        )
 
         try:
-            front_lm = self._landmarks_for(processed, PoseID.FRONT)
-            mesh_result = self._smpl.fit(
-                primary.image,
+            mesh_result = self._smpl.fit_multiview(
                 landmarks=front_lm,
                 height_cm=height_cm,
+                front_mask=front_mask,
+                side_mask=side_mask,
+                back_mask=back_mask,
             )
             if mesh_result is None:
-                return None, None
+                return None
 
             return mesh_result.vertices, mesh_result.faces
         except Exception as e:
             logger.warning("SMPL fitting failed: %s", e)
-            return None, None
+            return None
 
     # ------------------------------------------------------------------
     # Step 3 — extract raw measurements
@@ -232,15 +291,106 @@ class ScanPipeline:
         processed: list[_ProcessedFrame],
         height_source: str,
         height_confidence: Confidence,
+        mesh_fit_score: float = 1.0,
     ) -> tuple[ScanMeasurements, Confidence]:
         frame_composites = {p.pose_id.value: p.score.composite for p in processed}
         lm_vis = self._landmark_visibilities(processed)
 
         measurements = build_scan_measurements(
-            raw, frame_composites, lm_vis, height_source, height_confidence
+            raw, frame_composites, lm_vis, height_source, height_confidence,
+            mesh_fit_score=mesh_fit_score,
         )
         conf = overall_confidence(measurements)
         return measurements, conf
+
+    # ------------------------------------------------------------------
+    # Mesh fit score (F6) — silhouette IoU
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_mesh_fit_score(
+        vertices: Optional[np.ndarray],
+        processed: list[_ProcessedFrame],
+        height_cm: float,
+    ) -> float:
+        """
+        IoU between the SMPL mesh's convex-hull silhouette and the segmenter
+        body masks across available views.  Returns the mean IoU over (front,
+        side_left, back), using only views whose mask is present.
+
+        Returns 1.0 (no penalty) when vertices or all masks are absent.
+
+        We use a convex-hull approximation rather than full triangle
+        rasterization; it's fast (~1 ms per view) and sufficient to detect
+        gross mesh mis-scale / mis-placement that would invalidate
+        depth-derived measurements.
+        """
+        if vertices is None:
+            return 1.0
+
+        # (pose, projection axes) — front/back share (x,y); side uses (z,y)
+        views = [
+            (PoseID.FRONT,     (0, 1)),
+            (PoseID.SIDE_LEFT, (2, 1)),
+            (PoseID.BACK,      (0, 1)),
+        ]
+
+        ious: list[float] = []
+        for pose, (h_axis, v_axis) in views:
+            frame = next((p for p in processed if p.pose_id == pose), None)
+            if frame is None or frame.body_mask is None:
+                continue
+            iou = ScanPipeline._silhouette_iou(
+                vertices, frame.body_mask, height_cm, h_axis, v_axis
+            )
+            if iou is not None:
+                ious.append(iou)
+
+        return float(np.mean(ious)) if ious else 1.0
+
+    @staticmethod
+    def _silhouette_iou(
+        vertices: np.ndarray,
+        body_mask: np.ndarray,
+        height_cm: float,
+        h_axis: int,
+        v_axis: int,
+    ) -> Optional[float]:
+        """One-view silhouette IoU between the mesh convex hull and a body mask."""
+        # Some segmenters emit (H, W, 1) — collapse to 2D so np.where unpacks cleanly.
+        if body_mask.ndim == 3:
+            body_mask = body_mask.squeeze(-1)
+        if body_mask.ndim != 2:
+            return None
+        H, W = body_mask.shape
+        ys, xs = np.where(body_mask > 0)
+        if len(ys) == 0:
+            return None
+
+        y_max = int(ys.max())
+        x_center = float(xs.mean())
+        mask_height_px = y_max - int(ys.min())
+        if mask_height_px < 10:
+            return None
+
+        px_per_cm = mask_height_px / height_cm
+
+        vx = np.clip(
+            (vertices[:, h_axis] * px_per_cm + x_center).astype(np.int32), 0, W - 1
+        )
+        vy = np.clip(
+            (y_max - vertices[:, v_axis] * px_per_cm).astype(np.int32), 0, H - 1
+        )
+
+        pts = np.stack([vx, vy], axis=1)
+        hull = cv2.convexHull(pts)
+
+        silhouette = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(silhouette, hull, 255)
+
+        inter = int(np.count_nonzero((silhouette > 0) & (body_mask > 0)))
+        union = int(np.count_nonzero((silhouette > 0) | (body_mask > 0)))
+        return float(inter / union) if union > 0 else None
 
     # ------------------------------------------------------------------
     # Helpers

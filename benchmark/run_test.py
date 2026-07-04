@@ -32,8 +32,12 @@ try:
 except ImportError:
     sys.exit("Install Pillow:  pip install Pillow")
 
-BENCH_DIR    = Path(__file__).parent
-API_ENDPOINT = "/api/v1/scan/submit"
+BENCH_DIR        = Path(__file__).parent
+SUBMIT_ENDPOINT  = "/api/v1/scan/submit"
+STATUS_ENDPOINT  = "/api/v1/scan/status/{session_id}"
+RESULT_ENDPOINT  = "/api/v1/scan/result/{session_id}"
+POLL_INTERVAL_S  = 2.0
+MAX_POLL_S       = 180.0
 
 # All 7 pose column names in the CSV
 POSE_PHOTO_COLS = {
@@ -76,13 +80,41 @@ def _encode(path: str) -> str:
 
 
 def _call_api(base_url: str, height_cm: float, frames: list[dict]) -> dict:
-    resp = requests.post(
-        base_url.rstrip("/") + API_ENDPOINT,
+    """
+    Submit a scan, then poll /status until COMPLETE or FAILED.  Returns the
+    final ScanResponse dict from /result, or raises on timeout/failure.
+    """
+    import time
+
+    base = base_url.rstrip("/")
+    submit = requests.post(
+        base + SUBMIT_ENDPOINT,
         json={"height_cm": height_cm, "frames": frames},
-        timeout=180,
+        timeout=60,
     )
-    resp.raise_for_status()
-    return resp.json()
+    submit.raise_for_status()
+    session_id = submit.json()["session_id"]
+
+    deadline = time.monotonic() + MAX_POLL_S
+    while time.monotonic() < deadline:
+        st = requests.get(
+            base + STATUS_ENDPOINT.format(session_id=session_id),
+            timeout=10,
+        )
+        st.raise_for_status()
+        status = st.json()["status"]
+        if status == "COMPLETE":
+            res = requests.get(
+                base + RESULT_ENDPOINT.format(session_id=session_id),
+                timeout=30,
+            )
+            res.raise_for_status()
+            return res.json()
+        if status == "FAILED":
+            raise RuntimeError(f"Pipeline FAILED: {st.json().get('error', '?')}")
+        time.sleep(POLL_INTERVAL_S)
+
+    raise TimeoutError(f"Scan {session_id} did not complete within {MAX_POLL_S}s")
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +152,7 @@ def run_subject(row: dict, base_url: str, poses_to_use: list[str]) -> dict | Non
         print(f"  FAILED — {exc}")
         return None
 
-    status = resp.get("status")
+    status = (resp.get("status") or "").lower()
     if status != "complete":
         print(f"  pipeline {status}: {resp.get('error','')}")
         return None

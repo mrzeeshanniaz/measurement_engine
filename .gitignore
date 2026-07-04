@@ -14,16 +14,34 @@ venv/
 env/
 ENV/
 
-# Environment variables
+# Environment variables (but keep the reference template)
 .env
 .env.*
+!.env.example
+!backend/.env.example
 
 # Large model files (download separately)
+/models/
 backend/models/
 backend/app/measurement_engine/smpl_anthropometry/data/smpl/*.pkl
 
 # Raw test photos (HEIC source files)
 benchmark/test_photos/
+
+# Auto-generated benchmark reports (re-create with delivery_proof.py)
+benchmark/delivery_proof_report.json
+
+# SQLite job store + WAL files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+backend/data/
+data/
+_data/
+_jobs/
 
 # Claude Code local settings
 .claude/

@@ -63,6 +63,7 @@ class FrameScorer:
         pil_image: Image.Image,
         pose_id: PoseID,
         landmarks: Optional[dict[int, _LandmarkPoint]],
+        body_mask: Optional[np.ndarray] = None,
     ) -> FrameScore:
         img_rgb = np.array(pil_image.convert("RGB"))
         img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
@@ -72,7 +73,7 @@ class FrameScorer:
         light = self._lighting_score(img_gray)
         # Diagnostic only — not in composite per SCAN-04
         angle = self._angle_match(landmarks, pose_id)
-        occ   = self._occlusion_score(landmarks)
+        occ   = self._occlusion_score(landmarks, body_mask)
 
         # SCAN-04 formula: sharpness×0.30 + pose_quality×0.40 + lighting×0.30
         composite = _W_BLUR * blur + _W_POSE * pose + _W_LIGHT * light
@@ -146,8 +147,35 @@ class FrameScorer:
         angle_error = abs(ratio - expected_ratio)
         return float(np.clip(1.0 - angle_error, 0.0, 1.0))
 
-    def _occlusion_score(self, landmarks: Optional[dict]) -> float:
-        """Fraction of key joints with visibility > 0.5."""
+    def _occlusion_score(
+        self,
+        landmarks: Optional[dict],
+        body_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        """
+        When a body mask is available, blends pixel-coverage framing quality
+        (ideal: 15-50% of frame is body) with joint visibility.
+        Falls back to joint visibility only when mask is absent.
+        Diagnostic only — not in the SCAN-04 composite.
+        """
+        lm_score = self._joint_visibility_score(landmarks)
+
+        if body_mask is None:
+            return lm_score
+
+        coverage = float(np.count_nonzero(body_mask)) / body_mask.size
+        # Coverage outside [0.15, 0.50] means person is too far or too cropped.
+        if 0.15 <= coverage <= 0.50:
+            mask_score = 1.0
+        elif coverage < 0.15:
+            mask_score = coverage / 0.15
+        else:
+            mask_score = max(0.5, 1.0 - (coverage - 0.50) / 0.50)
+
+        return float(0.5 * mask_score + 0.5 * lm_score)
+
+    @staticmethod
+    def _joint_visibility_score(landmarks: Optional[dict]) -> float:
         if not landmarks:
             return 0.0
         visible = sum(

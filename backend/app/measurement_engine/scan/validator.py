@@ -39,21 +39,14 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.measurement_engine.scan.schemas import (
+    GarmentType,
     PoseID,
     ScanMeasurements,
+    Severity,
     ValidationIssue,
     ValidationResult,
 )
 from app.measurement_engine.scan.norms import NORMS, HARD_LIMITS
-
-
-# ---------------------------------------------------------------------------
-# Severity constants (mirror the string values in ValidationIssue)
-# ---------------------------------------------------------------------------
-
-class Severity:
-    ERROR   = "error"    # blocks order placement
-    WARNING = "warning"  # shown but does not block
 
 
 # Stitching-critical fields — LOW confidence on any of these blocks order (ORDER-03)
@@ -192,7 +185,7 @@ def _pass_norms(
 @dataclass
 class _Rule:
     code:         str
-    severity:     str
+    severity:     Severity
     message_tmpl: str   # uses {a}, {b}, {diff} placeholders
     fields:       list[str]
     rescan_poses: list[str]
@@ -453,21 +446,115 @@ def _pass_confidence(measurements: ScanMeasurements) -> list[ValidationIssue]:
 
 
 # ---------------------------------------------------------------------------
+# Pass 4 — Garment-specific required-field check (F8)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Pass 5 — Mesh quality gate (B8 / spec 5.1.7)
+# ---------------------------------------------------------------------------
+
+# Convex-hull silhouette IoU equivalent of the spec's 88% threshold.
+# Our IoU is a looser metric than per-pixel silhouette overlap, so 0.55 is
+# calibrated to roughly correspond to the 88% coverage threshold.
+_MESH_FIT_WARN_THRESHOLD  = 0.55
+_MESH_FIT_ERROR_THRESHOLD = 0.30
+
+
+def _pass_mesh_quality(mesh_fit_score: float) -> list[ValidationIssue]:
+    """
+    Warn (or error) when the fitted SMPL mesh silhouette doesn't match the
+    body well enough to trust depth-derived measurements (chest/waist depth,
+    circumferences).  Spec 5.1.7 requires ≥ 88% global fit score.
+    """
+    if mesh_fit_score >= _MESH_FIT_WARN_THRESHOLD:
+        return []
+
+    if mesh_fit_score < _MESH_FIT_ERROR_THRESHOLD:
+        return [ValidationIssue(
+            severity=Severity.ERROR,
+            code="mesh_fit_poor",
+            message=(
+                f"The body mesh fit score is very low ({mesh_fit_score:.2f}). "
+                "Depth-derived measurements (chest/waist depth, circumferences) are "
+                "unreliable and cannot be used for garment cutting."
+            ),
+            fields=["M01", "M03", "M05", "M30", "M31"],
+            rescan_poses=[PoseID.FRONT.value, PoseID.SIDE_LEFT.value],
+            suggestion=(
+                "Redo the scan in better lighting with tight-fitting clothes. "
+                "Ensure your full body is visible against a plain background."
+            ),
+        )]
+
+    return [ValidationIssue(
+        severity=Severity.WARNING,
+        code="mesh_fit_low",
+        message=(
+            f"The body mesh fit score is below the recommended threshold "
+            f"({mesh_fit_score:.2f} < {_MESH_FIT_WARN_THRESHOLD}). "
+            "Depth-derived measurements may be less accurate than usual."
+        ),
+        fields=["M30", "M31"],
+        rescan_poses=[PoseID.FRONT.value, PoseID.SIDE_LEFT.value],
+        suggestion=(
+            "For best results, redo the scan with tight-fitting clothes "
+            "against a plain, well-lit background."
+        ),
+    )]
+
+def _pass_garment_required(
+    measurements: ScanMeasurements,
+    garment_type: Optional[GarmentType],
+) -> list[ValidationIssue]:
+    """Raise an ERROR for each measurement that is required for garment_type but has no value."""
+    if garment_type is None:
+        return []
+
+    from app.measurement_engine.scan.garments import GARMENT_REQUIRED_FIELDS
+
+    required_codes = GARMENT_REQUIRED_FIELDS.get(garment_type, set())
+    issues: list[ValidationIssue] = []
+
+    for code in sorted(required_codes):
+        attr = _code_to_attr(code)
+        if _v(measurements, attr) is None:
+            issues.append(ValidationIssue(
+                severity=Severity.ERROR,
+                code=f"missing_required_{code.lower()}_{garment_type.value}",
+                message=(
+                    f"{code} is required to cut a {garment_type.value} but was not measured. "
+                    f"Ensure this body area is fully visible in the scan."
+                ),
+                fields=[code],
+                rescan_poses=_poses_for(code),
+                suggestion=f"Redo the scan so that your {attr.replace('_', ' ')} is clearly captured.",
+            ))
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def validate(
     measurements: ScanMeasurements,
     height_cm: float,
+    garment_type: Optional[GarmentType] = None,
+    mesh_fit_score: float = 1.0,
 ) -> ValidationResult:
     """
-    Run all three passes and return a consolidated ValidationResult.
+    Run all validation passes and return a consolidated ValidationResult.
+    Pass 4 (garment-required) is skipped when garment_type is None.
+    Pass 5 (mesh quality gate) is skipped when mesh_fit_score == 1.0 (no mesh).
     """
     issues: list[ValidationIssue] = []
     issues += _pass_hard_limits(measurements)
     issues += _pass_norms(measurements, height_cm)
     issues += _pass_cross_rules(measurements)
     issues += _pass_confidence(measurements)
+    issues += _pass_garment_required(measurements, garment_type)
+    issues += _pass_mesh_quality(mesh_fit_score)
 
     errors = [i for i in issues if i.severity == Severity.ERROR]
     is_valid = len(errors) == 0
@@ -534,7 +621,7 @@ def export_rules_for_frontend() -> dict:
     cross = [
         {
             "id":           r.code,
-            "severity":     r.severity,
+            "severity":     r.severity.value,
             "fields":       r.fields,
             "description":  r.message_tmpl,
             "suggestion":   r.suggestion,
